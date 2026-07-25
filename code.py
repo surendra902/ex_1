@@ -111,12 +111,19 @@ LATARB_STATE_PATH: str = '~/latarb_state.json'
 LATARB_FILLS_PATH: str = '~/latarb_fills.jsonl'
 LATARB_SETTLE_PATH: str = '~/latarb_settle.jsonl'
 # Live kill: pause LatArb when rolling fill rate stays below this after enough FAK attempts.
-LATARB_MIN_LIVE_FILL_RATE: float = 0.20
+# E1 FIX: renamed from LATARB_MIN_LIVE_FILL_RATE — that name collided with the
+# env var / config field of the live-proof sizing gate (default 0.40), so
+# setting the env var silently did NOT move this kill switch.  The kill switch
+# now has its own env knob; default behavior unchanged (0.20).
+LATARB_KILL_SWITCH_MIN_FILL_RATE: float = float(os.environ.get('LATARB_KILL_SWITCH_MIN_FILL_RATE', '0.20'))
 LATARB_MIN_LIVE_ATTEMPTS_FOR_KILL: int = 30
 LATARB_KILL_WINDOW: int = 50
 LATARB_KILL_COOLDOWN_S: float = 900.0
 # Default taker-delay horizon (s) when order-latency metrics are cold.
 LATARB_DEFAULT_TAKER_DELAY_S: float = 0.25
+# K7 FIX: hold this long before a fatal preflight exit (underfunded / balance
+# unverifiable) so a Restart=always supervisor cannot crash-loop every ~5s.
+FATAL_PREFLIGHT_HOLD_S: float = 600.0
 
 class FatalBotError(RuntimeError):
     pass
@@ -1444,6 +1451,11 @@ class OrderManager:
         self._lock = asyncio.Lock()
         self._rl = RateLimiter(cfg.rate_limit)
         self._cancel_rl = RateLimiter(max(5, cfg.rate_limit // 2))
+        # N8 FIX: IOC (FOK/FAK) fast path stays unthrottled up to this many
+        # sends per rolling second; beyond that it falls back to the shared
+        # limiter so a multi-coin burst cannot fire unbounded orders.
+        self._ioc_send_ts: Deque[float] = deque(maxlen=64)
+        self._ioc_burst_cap: int = max(4, int(cfg.rate_limit) // 2)
         self._rejects = 0
         self._metrics = metrics
         self._bg_tasks: Set[asyncio.Task] = set()
@@ -1690,6 +1702,14 @@ class OrderManager:
             # LatArb FOKs/FAKs are rare and time-critical â€” skip shared rate limiter.
             if otype_u not in ('FOK', 'FAK'):
                 await self._rl.acquire()
+            else:
+                # N8 FIX: bounded fast path — normal signal cadence (max 5
+                # concurrent evals) never waits here; only a runaway burst does.
+                _now_mono = time.monotonic()
+                self._ioc_send_ts.append(_now_mono)
+                if sum(1 for _t in self._ioc_send_ts if _now_mono - _t <= 1.0) > self._ioc_burst_cap:
+                    self.log.warning('IOC burst > %d/s — falling back to shared rate limiter', self._ioc_burst_cap)
+                    await self._rl.acquire()
             if await _reject_if_quote_stale('live'):
                 return None
             expiration_s = 0.0
@@ -1768,13 +1788,13 @@ class OrderManager:
                     # wait for a venue trade id rather than creating a synthetic ack.
                     self.log.info('%s immediate match oid=%s deferred to WS/REST trade-id reconciliation', otype_u, oid[:12])
                     try:
-                        await self.reconcile_fills()
+                        await self.reconcile_fills(wait_if_busy=True)
                     except Exception as e:
                         self.latch_fill_failure(f'post-match reconciliation failed for {oid}: {e}')
             elif is_ioc:
                 self.log.info('%s_ACCEPT %s %s oid=%s status=%s matched=0 ? REST reconcile before declaring a miss', otype_u, side.value, token_id[:12], oid[:12], status_u or '-')
                 try:
-                    await self.reconcile_fills()
+                    await self.reconcile_fills(wait_if_busy=True)
                 except Exception as e:
                     self.latch_fill_failure(f'post-{otype_u} reconciliation failed for {oid}: {e}')
                 async with self._lock:
@@ -1849,10 +1869,14 @@ class OrderManager:
                 self._rejects = 0
         return pruned
 
-    async def reconcile_fills(self) -> int:
+    async def reconcile_fills(self, wait_if_busy: bool = False) -> int:
         if not self.client.sdk or self._fill_replay_handler is None or self.cfg.dry_run:
             return 0
-        if self._reconcile_fills_lock.locked():
+        # C1 FIX: order-critical callers (place() post-FAK check) must not be
+        # silently skipped just because the 30s background pass holds the lock;
+        # they pass wait_if_busy=True and queue behind it.  The background loop
+        # keeps skip semantics so passes never pile up.
+        if self._reconcile_fills_lock.locked() and not wait_if_busy:
             return 0
         async with self._reconcile_fills_lock:
             first_pass = not self._first_reconcile_done
@@ -1908,6 +1932,12 @@ class OrderManager:
         def _try() -> List[dict]:
             _get = getattr(sdk, 'get_trades', None)
             if _get is None:
+                # C3 FIX (residual): never degrade silently — REST fill
+                # reconciliation is a live-safety layer; if this SDK build cannot
+                # serve it, say so loudly once instead of no-opping forever.
+                if not getattr(self, '_warned_no_get_trades', False):
+                    self._warned_no_get_trades = True
+                    self.log.critical('SDK has no get_trades — REST fill reconciliation is DISABLED on this build; WS is the only fill source')
                 return []
             try:
                 from py_clob_client_v2.clob_types import TradeParams as _TradeParams
@@ -2508,6 +2538,7 @@ class HyperPolyFeed:
                 if et == 'price_change':
                     delta_ts = time.monotonic()
                     msg_ex_ts = _ws_exchange_ts_ms(m)
+                    _delta_touched: Set[str] = set()  # L1 FIX
                     for c in m.get('price_changes', m.get('changes', [])):
                         c_tid = c.get('asset_id', tid)
                         if c_tid not in self._books or c_tid not in self._snapshot_received:
@@ -2535,7 +2566,24 @@ class HyperPolyFeed:
                         if bk.is_crossed:
                             self._snapshot_received.discard(c_tid)
                             bk.exchange_ts_ms = None
+                            _delta_touched.discard(c_tid)
                             self.log.debug('crossed book %s after delta â€” awaiting snapshot', c_tid[:10])
+                        else:
+                            _delta_touched.add(c_tid)
+                    # L1 FIX: fan callbacks out on delta-updated books (once per
+                    # token per message) so Polymarket-side moves trigger eval in
+                    # event-driven mode, not only 'book' snapshots / Binance ticks.
+                    for c_tid in _delta_touched:
+                        d_bk = self._books.get(c_tid)
+                        if d_bk is None:
+                            continue
+                        for cb in self._cbs:
+                            try:
+                                t = asyncio.create_task(cb(c_tid, d_bk))
+                                self._bg_tasks.add(t)
+                                t.add_done_callback(self._bg_tasks.discard)
+                            except Exception as cb_err:
+                                self.log.warning('book cb error: %s', cb_err)
                     continue
                 if tid not in self._books:
                     continue
@@ -2640,6 +2688,7 @@ class UserFeed:
         self._subscribed_mids: Set[str] = set()
         self._last_msg_ts: float = 0.0
         self._ws_fill_seq: int = 0
+        self._bg_tasks: Set[asyncio.Task] = set()  # N2 FIX: retain fire-and-forget tasks
         self.log = get_logger('UserFeed')
 
     def set_markets(self, t2m: Dict[str, Market]) -> None:
@@ -2649,7 +2698,11 @@ class UserFeed:
             new_mids = [mid for mid in self._mids if mid and mid not in self._subscribed_mids]
             if new_mids:
                 try:
-                    asyncio.get_running_loop().create_task(self._incremental_subscribe(new_mids))
+                    # N2 FIX: retain the task so it cannot be garbage-collected
+                    # mid-flight and a failure is observed via its done callback.
+                    t = asyncio.get_running_loop().create_task(self._incremental_subscribe(new_mids))
+                    self._bg_tasks.add(t)
+                    t.add_done_callback(self._bg_tasks.discard)
                 except RuntimeError:
                     pass
 
@@ -3292,6 +3345,15 @@ def kelly_size(p_final: float, entry_price: float, entry_slip: float, exit_slip:
     p_hold = max(0.0, min(1.0, p_hold_to_expiry))
     Cout_redeem = 1.0
     Cout_early = 1.0 - max(0.0, exit_slip)
+    # N9 FIX: an early exit is a taker SELL and pays the fee at the exit price;
+    # redemption at expiry does not.  Mirror the entry fee curve at the modeled
+    # exit price so EV is not systematically overstated for early exits.
+    _pe = max(1e-06, min(1.0 - 1e-06, Cout_early))
+    if category_fee_rate > 0:
+        exit_fee_per_share = max(0.0, category_fee_rate) * _pe * (1.0 - _pe)
+    else:
+        exit_fee_per_share = max(0.0, taker_fee_bps) * 0.0001 * _pe
+    Cout_early = max(0.0, Cout_early - exit_fee_per_share)
     Cout = p_hold * Cout_redeem + (1.0 - p_hold) * Cout_early
     if not 0.0 < Cin < 1.0:
         return 0.0 if negative_ev_skips else min_order_size
@@ -5616,17 +5678,17 @@ class LatencyArb:
                 return
             if n >= LATARB_MIN_LIVE_ATTEMPTS_FOR_KILL:
                 rw_fr = sum(rw) / n
-                if rw_fr >= LATARB_MIN_LIVE_FILL_RATE:
+                if rw_fr >= LATARB_KILL_SWITCH_MIN_FILL_RATE:
                     self._measure_only = False
                     self._measure_only_until = 0.0
                     self.log.info('LatArb re-enabled: rolling fill rate %.0f%% over last %d attempts recovered', 100.0 * rw_fr, n)
             return
         if n >= LATARB_MIN_LIVE_ATTEMPTS_FOR_KILL:
             rw_fr = sum(rw) / n
-            if rw_fr < LATARB_MIN_LIVE_FILL_RATE:
+            if rw_fr < LATARB_KILL_SWITCH_MIN_FILL_RATE:
                 self._measure_only = True
                 self._measure_only_until = now + LATARB_KILL_COOLDOWN_S
-                self.log.critical('LatArb measure-only: rolling fill rate %.0f%% over last %d FAK attempts < %.0f%% â€” pause %.0fs then re-check', 100.0 * rw_fr, n, 100.0 * LATARB_MIN_LIVE_FILL_RATE, LATARB_KILL_COOLDOWN_S)
+                self.log.critical('LatArb measure-only: rolling fill rate %.0f%% over last %d FAK attempts < %.0f%% â€” pause %.0fs then re-check', 100.0 * rw_fr, n, 100.0 * LATARB_KILL_SWITCH_MIN_FILL_RATE, LATARB_KILL_COOLDOWN_S)
 
     def _record_fok_attempt(self, *, filled: bool, sweep: float, edge: float, coin: str, market_id: str, token: str, model_prob: float, expected_vwap: Optional[float]=None, matched_size: float=0.0, fill_fraction: float=0.0, actual_fill_px: float=0.0) -> None:
         self.attempts += 1
@@ -6973,11 +7035,18 @@ class Bot:
                 self.log.warning('CLOB balance fetch failed â€” dry-run continues with simulated bankroll floor')
                 balance = self.cfg.min_order_size / max(self.cfg.max_bankroll_fraction, 1e-09)
             else:
+                # K7 FIX: hold before the fatal exit so a Restart=always
+                # supervisor cannot hammer the CLOB API in a ~5s crash loop.
+                self.log.critical('LIVE trading refused: could not fetch USDC balance (API failure). Holding %.0fs before exit to avoid a supervisor crash loop.', FATAL_PREFLIGHT_HOLD_S)
+                await asyncio.sleep(FATAL_PREFLIGHT_HOLD_S)
                 raise FatalBotError('LIVE trading refused: could not fetch USDC balance (API failure â€” not the same as a $0 wallet)')
         else:
             balance = balance_opt
         self.log.info('CLOB balance: $%.4f', balance)
         if not self.cfg.dry_run and balance <= 0:
+            # K7 FIX: hold before the fatal exit (see above).
+            self.log.critical('LIVE trading refused: non-positive USDC balance. Holding %.0fs before exit to avoid a supervisor crash loop.', FATAL_PREFLIGHT_HOLD_S)
+            await asyncio.sleep(FATAL_PREFLIGHT_HOLD_S)
             raise FatalBotError('LIVE trading refused: could not verify positive USDC balance')
         if balance < 1.0 and (not self.cfg.dry_run):
             self.log.warning('Low balance ($%.4f)', balance)
@@ -6988,6 +7057,10 @@ class Bot:
             else:
                 msg = 'REFUSING LIVE TRADE: balance $%.4f * max_bankroll_fraction %.2f = $%.4f < min_order_size $%.2f.  Cannot meet the venue minimum without violating the ruin-control cap.  Fund the account to >= $%.2f and restart.' % (balance, self.cfg.max_bankroll_fraction, balance * self.cfg.max_bankroll_fraction, self.cfg.min_order_size, _min_bankroll)
                 self.log.critical(msg)
+                # K7 FIX: hold before the fatal exit so a Restart=always
+                # supervisor cannot hammer the CLOB API in a ~5s crash loop
+                # while the account stays underfunded.
+                await asyncio.sleep(FATAL_PREFLIGHT_HOLD_S)
                 raise FatalBotError(msg)
         await self.recover_open_orders()
         if not self.cfg.dry_run:
@@ -7764,34 +7837,44 @@ class Bot:
     async def _status_loop(self) -> None:
         while self.running:
             await asyncio.sleep(60)
-            s = self.risk.status()
-            expected_gen = self.fivemin._balance_gen if self.fivemin is not None else None
-            bal = await self.client.get_balance()
-            if self.fivemin is not None and bal is not None:
-                await self._apply_balance_snapshot(bal, expected_gen=expected_gen)
-            bal_disp = self.fivemin._balance_cache if self.fivemin is not None else bal if bal is not None else float('nan')
-            trading = 'PAUSED:lib_broken' if self.client.lib_broken else f"HALTED:{s['reason']}" if s['halted'] else 'OK'
-            metrics_str = ''
-            if self.metrics:
-                ms = self.metrics.summary()
-                metrics_str = f"  lat_p50={ms['lat_p50_ms']:.0f}ms  lat_p95={ms['lat_p95_ms']:.0f}ms  fills={ms['fills']}"
-            self.log.info('STATUS  pnl=$%.2f  day=$%.2f  orders=%d  bal=$%.2f  %s  consec=%d%s', s['pnl'], s['daily'], s['orders'], bal_disp, trading, s.get('consec_losses', 0), metrics_str)
-            if self.fivemin:
-                try:
-                    n_settle = self.fivemin.settle_expired_latarb(self.fivemin_markets, time.time())
-                    if n_settle:
-                        self.log.info('  LATARB settle_poll due=%d', n_settle)
-                except Exception as se:
-                    self.log.debug('settle_expired_latarb status: %s', se)
-                self.log.info('  DIAG  guard_hits=%d  triggers=%d  open_prices=%d  traded=%d  bal_gen=%d  shock_cd=%s', self.fivemin._diag_guard_hits, self.fivemin._diag_trigger_calls, len(self.fivemin._open_prices), len(self.fivemin._traded), self.fivemin._balance_gen, self.fivemin.in_capital_shock_cooldown())
-            if self.latency_arb is not None and (self.cfg.latency_arb_enabled or self.latency_arb.attempts > 0):
-                ls = self.latency_arb.fills_summary()
-                self.log.info('  LATARB fills attempts=%d fills=%d miss=%d rate=%.1f%% roll_n=%d roll_rate=%.1f%% avg_edge=%.3f avg_slip=%.1fbps measure_only=%s', ls['attempts'], ls['fills'], ls['misses'], 100.0 * ls['fill_rate'], ls.get('rolling_n', 0), 100.0 * ls.get('rolling_fill_rate', 0.0), ls['avg_edge'], ls['avg_slip_bps'], self.latency_arb._measure_only)
-                skip_summary = self.latency_arb.skip_summary()
-                if skip_summary:
-                    self.log.info('  LATARB skips %s', skip_summary)
-                # Rolling kill / re-enable (LatArb-only; never halts directional).
-                self.latency_arb.maybe_update_kill_switch()
+            # N1 FIX: a transient error (balance API blip, metrics hiccup) must not
+            # kill the process; fatal state errors still propagate.
+            try:
+                s = self.risk.status()
+                expected_gen = self.fivemin._balance_gen if self.fivemin is not None else None
+                bal = await self.client.get_balance()
+                if self.fivemin is not None and bal is not None:
+                    await self._apply_balance_snapshot(bal, expected_gen=expected_gen)
+                bal_disp = self.fivemin._balance_cache if self.fivemin is not None else bal if bal is not None else float('nan')
+                trading = 'PAUSED:lib_broken' if self.client.lib_broken else f"HALTED:{s['reason']}" if s['halted'] else 'OK'
+                metrics_str = ''
+                if self.metrics:
+                    ms = self.metrics.summary()
+                    metrics_str = f"  lat_p50={ms['lat_p50_ms']:.0f}ms  lat_p95={ms['lat_p95_ms']:.0f}ms  fills={ms['fills']}"
+                self.log.info('STATUS  pnl=$%.2f  day=$%.2f  orders=%d  bal=$%.2f  %s  consec=%d%s', s['pnl'], s['daily'], s['orders'], bal_disp, trading, s.get('consec_losses', 0), metrics_str)
+                if self.fivemin:
+                    try:
+                        n_settle = self.fivemin.settle_expired_latarb(self.fivemin_markets, time.time())
+                        if n_settle:
+                            self.log.info('  LATARB settle_poll due=%d', n_settle)
+                    except Exception as se:
+                        self.log.debug('settle_expired_latarb status: %s', se)
+                    self.log.info('  DIAG  guard_hits=%d  triggers=%d  open_prices=%d  traded=%d  bal_gen=%d  shock_cd=%s', self.fivemin._diag_guard_hits, self.fivemin._diag_trigger_calls, len(self.fivemin._open_prices), len(self.fivemin._traded), self.fivemin._balance_gen, self.fivemin.in_capital_shock_cooldown())
+                if self.latency_arb is not None and (self.cfg.latency_arb_enabled or self.latency_arb.attempts > 0):
+                    ls = self.latency_arb.fills_summary()
+                    self.log.info('  LATARB fills attempts=%d fills=%d miss=%d rate=%.1f%% roll_n=%d roll_rate=%.1f%% avg_edge=%.3f avg_slip=%.1fbps measure_only=%s', ls['attempts'], ls['fills'], ls['misses'], 100.0 * ls['fill_rate'], ls.get('rolling_n', 0), 100.0 * ls.get('rolling_fill_rate', 0.0), ls['avg_edge'], ls['avg_slip_bps'], self.latency_arb._measure_only)
+                    skip_summary = self.latency_arb.skip_summary()
+                    if skip_summary:
+                        self.log.info('  LATARB skips %s', skip_summary)
+                    # Rolling kill / re-enable (LatArb-only; never halts directional).
+                    self.latency_arb.maybe_update_kill_switch()
+
+            except asyncio.CancelledError:
+                raise
+            except (FatalBotError, RuntimeStateError):
+                raise
+            except Exception as e:
+                self.log.warning('status loop iteration error (non-fatal): %s', e)
 
     async def _reconcile_loop(self) -> None:
         await asyncio.sleep(25)
@@ -7837,27 +7920,38 @@ class Bot:
     async def _health_loop(self) -> None:
         await asyncio.sleep(45)
         while self.running:
-            shard_ages = self.polyfeed.shard_ages()
-            for sid, age in shard_ages.items():
-                if age > 90:
-                    self.log.warning('Shard %d stale (%.0fs) â€” restarting', sid, age)
-                    await self.polyfeed.restart_shard(sid)
-            overall_age = self.polyfeed.last_msg_age_s
-            if overall_age > 120:
-                self.log.warning('ALL shards stale â€” full reconnect')
-                await self.polyfeed.stop()
-                t = asyncio.create_task(self.polyfeed.run(), name='polyfeed_restart')
-                self._bg_tasks.add(t)
-                t.add_done_callback(self._bg_tasks.discard)
-            stale_binance = [c for c in self.cfg.coins if self.binance.price_age_s(c) > 15.0]
-            if stale_binance:
-                self.log.warning('Binance feed stale for %s â€” reconnecting', ', '.join(stale_binance))
-                await self.binance.restart()
-            stale_cl = [c for c in self.cfg.coins if self.chainlink.price_age_s(c) > 20.0]
-            if stale_cl:
-                self.log.warning('Chainlink RTDS stale for %s â€” reconnecting', ', '.join(stale_cl))
-                await self.chainlink.restart()
-            await asyncio.sleep(45)
+            # N1 FIX: guard feed-health checks; a failed restart attempt retries
+            # next cycle instead of killing the process.
+            try:
+                shard_ages = self.polyfeed.shard_ages()
+                for sid, age in shard_ages.items():
+                    if age > 90:
+                        self.log.warning('Shard %d stale (%.0fs) â€” restarting', sid, age)
+                        await self.polyfeed.restart_shard(sid)
+                overall_age = self.polyfeed.last_msg_age_s
+                if overall_age > 120:
+                    self.log.warning('ALL shards stale â€” full reconnect')
+                    await self.polyfeed.stop()
+                    t = asyncio.create_task(self.polyfeed.run(), name='polyfeed_restart')
+                    self._bg_tasks.add(t)
+                    t.add_done_callback(self._bg_tasks.discard)
+                stale_binance = [c for c in self.cfg.coins if self.binance.price_age_s(c) > 15.0]
+                if stale_binance:
+                    self.log.warning('Binance feed stale for %s â€” reconnecting', ', '.join(stale_binance))
+                    await self.binance.restart()
+                stale_cl = [c for c in self.cfg.coins if self.chainlink.price_age_s(c) > 20.0]
+                if stale_cl:
+                    self.log.warning('Chainlink RTDS stale for %s â€” reconnecting', ', '.join(stale_cl))
+                    await self.chainlink.restart()
+                await asyncio.sleep(45)
+
+            except asyncio.CancelledError:
+                raise
+            except (FatalBotError, RuntimeStateError):
+                raise
+            except Exception as e:
+                self.log.warning('health loop iteration error (non-fatal): %s', e)
+                await asyncio.sleep(45)
 
     async def _fivemin_timer_loop(self) -> None:
         interval = self.cfg.strategy_interval_s
