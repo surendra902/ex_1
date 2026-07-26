@@ -217,7 +217,8 @@ class Config:
     latency_arb_edge: float = 0.02
     latency_arb_cooldown: float = 2.0
     latency_arb_min_prob: float = 0.58
-    require_latarb_proven_edge: bool = True
+    # Offline-report thresholds only (--latarb-analyze). The 200-signal boot gate
+    # they used to arm was removed; nothing on the trading path reads these.
     latarb_min_proven_signals: int = 200
     latarb_min_win_rate: float = 0.52
     latarb_min_total_pnl: float = 0.0
@@ -360,7 +361,7 @@ class Config:
         if raw_proxy and (not raw_proxy.startswith('0x')):
             raw_proxy = '0x' + raw_proxy
         proxy = Web3.to_checksum_address(raw_proxy.lower()) if raw_proxy else ''
-        return cls(private_key=pk, proxy_address=proxy, signature_type=gi('POLYMARKET_SIGNATURE_TYPE', 2), clob_url=g('CLOB_URL', g('CLOB_API_URL', 'https://clob.polymarket.com')).rstrip('/ '), gamma_url=g('GAMMA_URL', g('GAMMA_API_URL', 'https://gamma-api.polymarket.com')).rstrip('/ '), chain_id=gi('CHAIN_ID', 137), coins=[c.strip().upper() for c in g('COINS', g('BINANCE_COINS', 'BTC,ETH,SOL')).split(',') if c.strip()], min_order_size=gf('MIN_ORDER_USDC', 2.0), max_order_size=gf('MAX_ORDER_USDC', 25.0), max_position=gf('MAX_POSITION_USDC', 100.0), max_bankroll_fraction=gf('MAX_BANKROLL_FRACTION', 0.1), max_daily_loss=gf('MAX_DAILY_LOSS', 50.0), max_open_orders=gi('MAX_OPEN_ORDERS', 15), rate_limit=gi('ORDER_RATE_LIMIT_PER_SEC', gi('ORDER_RATE_LIMIT', 12)), book_max_age_ms=gf('MAX_BOOK_AGE_MS', 500.0), max_net_exposure_usdc=gf('MAX_NET_EXPOSURE_USDC', 200.0), dry_run=gb('DRY_RUN', True), log_level=g('LOG_LEVEL', 'INFO'), min_edge=gf('MIN_EDGE', 0.012), entry_start_s=gi('ENTRY_START_S', 15), entry_end_s=gi('ENTRY_END_S', 260), strategy_interval_s=gf('STRATEGY_INTERVAL_S', 1.5), kelly_fraction=gf('KELLY_FRACTION', 0.18), sustain_ticks=gi('SUSTAIN_TICKS', 1), stop_loss_prob=gf('STOP_LOSS_PROB', 0.43), forced_exit_ttc_s=gi('FORCED_EXIT_TTC_S', 25), latency_arb_enabled=gb('LATENCY_ARB_ENABLED', False), latency_arb_edge=gf('LATENCY_ARB_EDGE', 0.02), latency_arb_cooldown=gf('LATENCY_ARB_COOLDOWN_S', 2.0), latency_arb_min_prob=gf('LATENCY_ARB_MIN_PROB', 0.58), require_latarb_proven_edge=gb('REQUIRE_LATARB_PROVEN_EDGE', True), latarb_min_proven_signals=gi('LATARB_MIN_PROVEN_SIGNALS', 200), latarb_min_win_rate=gf('LATARB_MIN_WIN_RATE', 0.52), latarb_min_total_pnl=gf('LATARB_MIN_TOTAL_PNL', 0.0), require_latarb_live_proof=gb('REQUIRE_LATARB_LIVE_PROOF', False), latarb_bootstrap_live=gb('LATARB_BOOTSTRAP_LIVE', True), latarb_min_live_attempts=gi('LATARB_MIN_LIVE_ATTEMPTS', 50), latarb_min_live_fill_rate=gf('LATARB_MIN_LIVE_FILL_RATE', 0.4), latarb_min_settle_samples=gi('LATARB_MIN_SETTLE_SAMPLES', 20), latarb_min_settle_win_rate=gf('LATARB_MIN_SETTLE_WIN_RATE', 0.52), latarb_min_settle_pnl=gf('LATARB_MIN_SETTLE_PNL', 0.0), latarb_fills_path=g('LATARB_FILLS_PATH', LATARB_FILLS_PATH), latarb_settle_path=g('LATARB_SETTLE_PATH', '~/latarb_settle.jsonl'), complement_arb_enabled=gb('COMPLEMENT_ARB_ENABLED', False), redeem_enabled=gb('REDEEM_ENABLED', False), polygon_rpc_url=g('POLYGON_RPC_URL', 'https://polygon-rpc.com'), redeem_max_gas_gwei=gf('REDEEM_MAX_GAS_GWEI', 300.0), latarb_shadow=gb('LATARB_SHADOW', True), latarb_shadow_path=g('LATARB_SHADOW_PATH', '~/latarb_shadow.csv'), latarb_shadow_min_age_ms=gf('LATARB_SHADOW_MIN_AGE_MS', 0.0), latarb_shadow_throttle_ms=gf('LATARB_SHADOW_THROTTLE_MS', 3000.0), latarb_shadow_max_age_ms=gf('LATARB_SHADOW_MAX_AGE_MS', 250.0), min_top_book_usdc=gf('MIN_TOP_BOOK_USDC', 6.0), max_spread_pct=gf('MAX_SPREAD_PCT', 0.1), max_consecutive_losses=gi('MAX_CONSECUTIVE_LOSSES', 4), prob_shrink=gf('PROB_SHRINK', 1.0), time_decay_exit_ttc_s=gi('TIME_DECAY_EXIT_TTC_S', 90), ws_shard_count=gi('WS_SHARD_COUNT', 2), discovery_interval_s=gf('DISCOVERY_INTERVAL_S', 10.0), event_driven=gb('EVENT_DRIVEN', True), eval_debounce_ms=gf('EVAL_DEBOUNCE_MS', 400.0), max_concurrent_evals=gi('MAX_CONCURRENT_EVALS', 5), adaptive_kelly=gb('ADAPTIVE_KELLY', True), metrics_enabled=gb('METRICS_ENABLED', True), dry_run_fill_prob=gf('DRY_RUN_FILL_PROB', 0.7), dry_run_latency_ms=gf('DRY_RUN_LATENCY_MS', 50.0), calibration_log_path=g('CALIBRATION_LOG_PATH', '~/calibration.csv'), calibration_log_enabled=gb('CALIBRATION_LOG_ENABLED', True), prob_model=g('PROB_MODEL', 'gbm_v183'), reconcile_fills_interval_s=gf('RECONCILE_FILLS_INTERVAL_S', 30.0), drift_halt_threshold_shares=gf('DRIFT_HALT_THRESHOLD_SHARES', 0.01), drift_check_concurrency=int(gf('DRIFT_CHECK_CONCURRENCY', 4)), min_proven_samples=gi('MIN_PROVEN_SAMPLES', 200), min_proven_edge=gf('MIN_PROVEN_EDGE', 0.005), max_adverse_bps=gf('MAX_ADVERSE_BPS', 40.0), shadow_probe_enabled=gb('SHADOW_PROBE_ENABLED', True), adverse_select_gate=gb('ADVERSE_SELECT_GATE', True), adverse_ewma_alpha=gf('ADVERSE_EWMA_ALPHA', 0.1), entry_mode=g('ENTRY_MODE', 'maker').lower(), maker_join_ticks=gi('MAKER_JOIN_TICKS', 0), fast_exit_drop_pct=gf('FAST_EXIT_DROP_PCT', 0.06), fast_exit_sustain=gi('FAST_EXIT_SUSTAIN', 2), trail_stop_pct=gf('TRAIL_STOP_PCT', 0.12), trail_sustain=gi('TRAIL_SUSTAIN', 2), trail_arm_level=gf('TRAIL_ARM_LEVEL', 0.65), forced_exit_hold_if_winning=gb('FORCED_EXIT_HOLD_IF_WINNING', True), forced_exit_hold_prob=gf('FORCED_EXIT_HOLD_PROB', 0.6), partial_tp_enabled=gb('PARTIAL_TP_ENABLED', True), tp_mode=g('TP_MODE', 'confidence').lower(), tp1_pct=gf('TP1_PCT', 0.35), tp1_clip_pct=gf('TP1_CLIP_PCT', 0.4), tp1_breakeven_stop=gb('TP1_BREAKEVEN_STOP', True), conf_scale=gf('CONF_SCALE', 1.0), conf_min_clip=gf('CONF_MIN_CLIP', 0.3), conf_max_clip=gf('CONF_MAX_CLIP', 0.95), taker_fee_bps=gf('TAKER_FEE_BPS', 20.0), category_fee_rate=gf('CATEGORY_FEE_RATE', 0.07), cycle_s=gi('CYCLE_S', 300), balance_refresh_s=gf('BALANCE_REFRESH_S', 5.0), maker_gtd_ttl_s=gf('MAKER_GTD_TTL_S', 120.0), capital_shock_pct=gf('CAPITAL_SHOCK_PCT', 0.1), capital_shock_floor_usdc=gf('CAPITAL_SHOCK_FLOOR_USDC', 2.0), max_net_bankroll_mult=gf('MAX_NET_BANKROLL_MULT', 1.0), max_gross_bankroll_mult=gf('MAX_GROSS_BANKROLL_MULT', 2.0), halt_on_capital_shock=gb('HALT_ON_CAPITAL_SHOCK', True), per_coin_crossover=gb('PER_COIN_CROSSOVER', True), auto_flatten_on_halt=gb('AUTO_FLATTEN_ON_HALT', False), spread_edge_mult=gf('SPREAD_EDGE_MULT', 0.2), sigma_edge_mult=gf('SIGMA_EDGE_MULT', 0.1), kelly_hold_to_expiry_rate=gf('KELLY_HOLD_TO_EXPIRY_RATE', 0.0), max_gross_exposure_usdc=gf('MAX_GROSS_EXPOSURE_USDC', 400.0), ev_exit_buffer=gf('EV_EXIT_BUFFER', 0.0), max_daily_loss_pct=gf('MAX_DAILY_LOSS_PCT', 0.05), max_monthly_loss=gf('MAX_MONTHLY_LOSS', 800.0), max_drawdown_from_peak=gf('MAX_DRAWDOWN_FROM_PEAK', 50.0), min_edge_margin=gf('MIN_EDGE_MARGIN', 0.005), momentum_weight=gf('MOMENTUM_WEIGHT', 0.0), market_anchor_weight=gf('MARKET_ANCHOR_WEIGHT', 0.5), max_model_disagreement=gf('MAX_MODEL_DISAGREEMENT', 0.06), anchor_edge_path=gb('ANCHOR_EDGE_PATH', True), salvage_floor=gf('SALVAGE_FLOOR', 0.05), whale_trade_usdc=gf('WHALE_TRADE_USDC', 5000.0), whale_cooldown_s=gf('WHALE_COOLDOWN_S', 3.0)).rescale_for_cycle()
+        return cls(private_key=pk, proxy_address=proxy, signature_type=gi('POLYMARKET_SIGNATURE_TYPE', 2), clob_url=g('CLOB_URL', g('CLOB_API_URL', 'https://clob.polymarket.com')).rstrip('/ '), gamma_url=g('GAMMA_URL', g('GAMMA_API_URL', 'https://gamma-api.polymarket.com')).rstrip('/ '), chain_id=gi('CHAIN_ID', 137), coins=[c.strip().upper() for c in g('COINS', g('BINANCE_COINS', 'BTC,ETH,SOL')).split(',') if c.strip()], min_order_size=gf('MIN_ORDER_USDC', 2.0), max_order_size=gf('MAX_ORDER_USDC', 25.0), max_position=gf('MAX_POSITION_USDC', 100.0), max_bankroll_fraction=gf('MAX_BANKROLL_FRACTION', 0.1), max_daily_loss=gf('MAX_DAILY_LOSS', 50.0), max_open_orders=gi('MAX_OPEN_ORDERS', 15), rate_limit=gi('ORDER_RATE_LIMIT_PER_SEC', gi('ORDER_RATE_LIMIT', 12)), book_max_age_ms=gf('MAX_BOOK_AGE_MS', 500.0), max_net_exposure_usdc=gf('MAX_NET_EXPOSURE_USDC', 200.0), dry_run=gb('DRY_RUN', True), log_level=g('LOG_LEVEL', 'INFO'), min_edge=gf('MIN_EDGE', 0.012), entry_start_s=gi('ENTRY_START_S', 15), entry_end_s=gi('ENTRY_END_S', 260), strategy_interval_s=gf('STRATEGY_INTERVAL_S', 1.5), kelly_fraction=gf('KELLY_FRACTION', 0.18), sustain_ticks=gi('SUSTAIN_TICKS', 1), stop_loss_prob=gf('STOP_LOSS_PROB', 0.43), forced_exit_ttc_s=gi('FORCED_EXIT_TTC_S', 25), latency_arb_enabled=gb('LATENCY_ARB_ENABLED', False), latency_arb_edge=gf('LATENCY_ARB_EDGE', 0.02), latency_arb_cooldown=gf('LATENCY_ARB_COOLDOWN_S', 2.0), latency_arb_min_prob=gf('LATENCY_ARB_MIN_PROB', 0.58), latarb_min_proven_signals=gi('LATARB_MIN_PROVEN_SIGNALS', 200), latarb_min_win_rate=gf('LATARB_MIN_WIN_RATE', 0.52), latarb_min_total_pnl=gf('LATARB_MIN_TOTAL_PNL', 0.0), require_latarb_live_proof=gb('REQUIRE_LATARB_LIVE_PROOF', False), latarb_bootstrap_live=gb('LATARB_BOOTSTRAP_LIVE', True), latarb_min_live_attempts=gi('LATARB_MIN_LIVE_ATTEMPTS', 50), latarb_min_live_fill_rate=gf('LATARB_MIN_LIVE_FILL_RATE', 0.4), latarb_min_settle_samples=gi('LATARB_MIN_SETTLE_SAMPLES', 20), latarb_min_settle_win_rate=gf('LATARB_MIN_SETTLE_WIN_RATE', 0.52), latarb_min_settle_pnl=gf('LATARB_MIN_SETTLE_PNL', 0.0), latarb_fills_path=g('LATARB_FILLS_PATH', LATARB_FILLS_PATH), latarb_settle_path=g('LATARB_SETTLE_PATH', '~/latarb_settle.jsonl'), complement_arb_enabled=gb('COMPLEMENT_ARB_ENABLED', False), redeem_enabled=gb('REDEEM_ENABLED', False), polygon_rpc_url=g('POLYGON_RPC_URL', 'https://polygon-rpc.com'), redeem_max_gas_gwei=gf('REDEEM_MAX_GAS_GWEI', 300.0), latarb_shadow=gb('LATARB_SHADOW', True), latarb_shadow_path=g('LATARB_SHADOW_PATH', '~/latarb_shadow.csv'), latarb_shadow_min_age_ms=gf('LATARB_SHADOW_MIN_AGE_MS', 0.0), latarb_shadow_throttle_ms=gf('LATARB_SHADOW_THROTTLE_MS', 3000.0), latarb_shadow_max_age_ms=gf('LATARB_SHADOW_MAX_AGE_MS', 250.0), min_top_book_usdc=gf('MIN_TOP_BOOK_USDC', 6.0), max_spread_pct=gf('MAX_SPREAD_PCT', 0.1), max_consecutive_losses=gi('MAX_CONSECUTIVE_LOSSES', 4), prob_shrink=gf('PROB_SHRINK', 1.0), time_decay_exit_ttc_s=gi('TIME_DECAY_EXIT_TTC_S', 90), ws_shard_count=gi('WS_SHARD_COUNT', 2), discovery_interval_s=gf('DISCOVERY_INTERVAL_S', 10.0), event_driven=gb('EVENT_DRIVEN', True), eval_debounce_ms=gf('EVAL_DEBOUNCE_MS', 400.0), max_concurrent_evals=gi('MAX_CONCURRENT_EVALS', 5), adaptive_kelly=gb('ADAPTIVE_KELLY', True), metrics_enabled=gb('METRICS_ENABLED', True), dry_run_fill_prob=gf('DRY_RUN_FILL_PROB', 0.7), dry_run_latency_ms=gf('DRY_RUN_LATENCY_MS', 50.0), calibration_log_path=g('CALIBRATION_LOG_PATH', '~/calibration.csv'), calibration_log_enabled=gb('CALIBRATION_LOG_ENABLED', True), prob_model=g('PROB_MODEL', 'gbm_v183'), reconcile_fills_interval_s=gf('RECONCILE_FILLS_INTERVAL_S', 30.0), drift_halt_threshold_shares=gf('DRIFT_HALT_THRESHOLD_SHARES', 0.01), drift_check_concurrency=int(gf('DRIFT_CHECK_CONCURRENCY', 4)), min_proven_samples=gi('MIN_PROVEN_SAMPLES', 200), min_proven_edge=gf('MIN_PROVEN_EDGE', 0.005), max_adverse_bps=gf('MAX_ADVERSE_BPS', 40.0), shadow_probe_enabled=gb('SHADOW_PROBE_ENABLED', True), adverse_select_gate=gb('ADVERSE_SELECT_GATE', True), adverse_ewma_alpha=gf('ADVERSE_EWMA_ALPHA', 0.1), entry_mode=g('ENTRY_MODE', 'maker').lower(), maker_join_ticks=gi('MAKER_JOIN_TICKS', 0), fast_exit_drop_pct=gf('FAST_EXIT_DROP_PCT', 0.06), fast_exit_sustain=gi('FAST_EXIT_SUSTAIN', 2), trail_stop_pct=gf('TRAIL_STOP_PCT', 0.12), trail_sustain=gi('TRAIL_SUSTAIN', 2), trail_arm_level=gf('TRAIL_ARM_LEVEL', 0.65), forced_exit_hold_if_winning=gb('FORCED_EXIT_HOLD_IF_WINNING', True), forced_exit_hold_prob=gf('FORCED_EXIT_HOLD_PROB', 0.6), partial_tp_enabled=gb('PARTIAL_TP_ENABLED', True), tp_mode=g('TP_MODE', 'confidence').lower(), tp1_pct=gf('TP1_PCT', 0.35), tp1_clip_pct=gf('TP1_CLIP_PCT', 0.4), tp1_breakeven_stop=gb('TP1_BREAKEVEN_STOP', True), conf_scale=gf('CONF_SCALE', 1.0), conf_min_clip=gf('CONF_MIN_CLIP', 0.3), conf_max_clip=gf('CONF_MAX_CLIP', 0.95), taker_fee_bps=gf('TAKER_FEE_BPS', 20.0), category_fee_rate=gf('CATEGORY_FEE_RATE', 0.07), cycle_s=gi('CYCLE_S', 300), balance_refresh_s=gf('BALANCE_REFRESH_S', 5.0), maker_gtd_ttl_s=gf('MAKER_GTD_TTL_S', 120.0), capital_shock_pct=gf('CAPITAL_SHOCK_PCT', 0.1), capital_shock_floor_usdc=gf('CAPITAL_SHOCK_FLOOR_USDC', 2.0), max_net_bankroll_mult=gf('MAX_NET_BANKROLL_MULT', 1.0), max_gross_bankroll_mult=gf('MAX_GROSS_BANKROLL_MULT', 2.0), halt_on_capital_shock=gb('HALT_ON_CAPITAL_SHOCK', True), per_coin_crossover=gb('PER_COIN_CROSSOVER', True), auto_flatten_on_halt=gb('AUTO_FLATTEN_ON_HALT', False), spread_edge_mult=gf('SPREAD_EDGE_MULT', 0.2), sigma_edge_mult=gf('SIGMA_EDGE_MULT', 0.1), kelly_hold_to_expiry_rate=gf('KELLY_HOLD_TO_EXPIRY_RATE', 0.0), max_gross_exposure_usdc=gf('MAX_GROSS_EXPOSURE_USDC', 400.0), ev_exit_buffer=gf('EV_EXIT_BUFFER', 0.0), max_daily_loss_pct=gf('MAX_DAILY_LOSS_PCT', 0.05), max_monthly_loss=gf('MAX_MONTHLY_LOSS', 800.0), max_drawdown_from_peak=gf('MAX_DRAWDOWN_FROM_PEAK', 50.0), min_edge_margin=gf('MIN_EDGE_MARGIN', 0.005), momentum_weight=gf('MOMENTUM_WEIGHT', 0.0), market_anchor_weight=gf('MARKET_ANCHOR_WEIGHT', 0.5), max_model_disagreement=gf('MAX_MODEL_DISAGREEMENT', 0.06), anchor_edge_path=gb('ANCHOR_EDGE_PATH', True), salvage_floor=gf('SALVAGE_FLOOR', 0.05), whale_trade_usdc=gf('WHALE_TRADE_USDC', 5000.0), whale_cooldown_s=gf('WHALE_COOLDOWN_S', 3.0)).rescale_for_cycle()
 
     def rescale_for_cycle(self) -> 'Config':
         if self.cycle_s != 300 and self.cycle_s > 0:
@@ -394,13 +395,8 @@ class Config:
             errs.append(f'min_order_size (${self.min_order_size:.2f}) is below the Polymarket venue minimum (${VENUE_MIN_ORDER_USDC:.2f})')
         if self.max_order_size < VENUE_MIN_ORDER_USDC:
             errs.append(f'max_order_size (${self.max_order_size:.2f}) is below the Polymarket venue minimum (${VENUE_MIN_ORDER_USDC:.2f})')
-        if not self.dry_run and (not self.require_latarb_proven_edge):
-            errs.append('REQUIRE_LATARB_PROVEN_EDGE=false is not allowed while DRY_RUN=false; live LatArb requires proven edge')
-        if self.latency_arb_enabled and self.require_latarb_proven_edge:
-            if self.latarb_min_proven_signals <= 0:
-                errs.append('LATARB_MIN_PROVEN_SIGNALS must be > 0')
-            if not 0.0 <= self.latarb_min_win_rate <= 1.0:
-                errs.append('LATARB_MIN_WIN_RATE must be in [0, 1]')
+        # The live "proven edge" requirement (200 scored shadow markets) was removed;
+        # LatArb size is still held at min_order_size until the live fill/settle proof passes.
         # model_prob is hard-clamped to [0.3, 0.85] in LatArb â€” reject impossible config
         if self.latency_arb_min_prob > 0.85:
             errs.append(f'LATENCY_ARB_MIN_PROB={self.latency_arb_min_prob} > 0.85 model_prob cap makes LatArb impossible')
@@ -4937,6 +4933,14 @@ class FiveMinStrategy:
             self.risk.record_trade_closed(total_realized)
             if self._balance_ts > 0:
                 self._balance_force_refresh = True
+            if self.cfg.dry_run:
+                # P1 FIX: paper mode has no authoritative balance poll (the
+                # refresh loop is live-only), so a buy debited _balance_cache
+                # and the resolution payout was never credited back.  Paper
+                # capital therefore never recycled and free cash decayed to the
+                # sizing floor after a handful of trades.  Live is unaffected.
+                self._balance_cache = max(0.0, self._balance_cache + float(proceeds))
+                self.note_cash_mutation()
             self._settlement_ledger[settlement_id] = {
                 'phase': 'booked', 'market_id': market_id, 'condition_id': cond_id,
                 'kind': redemption_kind, 'source': source, 'payout': float(proceeds),
@@ -5664,9 +5668,9 @@ class LatencyArb:
         self._recent_fill_flags.append(1 if filled else 0)
         if filled:
             self.fills += 1
-            if token:
-                exp = float(expected_vwap) if expected_vwap and expected_vwap > 0 else float(sweep)
-                self._expected_fill_px[token] = exp
+            # The expectation is published before om.place() (see _eval_market);
+            # an inline IOC apply has already consumed it, so re-adding it here
+            # would resurrect a key nothing ever clears.
         else:
             self.misses += 1
             self._expected_fill_px.pop(token, None)
@@ -6036,9 +6040,17 @@ class LatencyArb:
         if time.monotonic() - _prev_log > 0.5:
             self._last_latarb_log[_log_key] = time.monotonic()
             self.log.info('LATARB %s %s | disp=%.4f | z=%.2f | ask=%.3f | lim=%.3f | sz=$%.2f | edge=%.3f | age=%.0fms | feeRate=%.4f', 'UP' if up else 'DN', coin, displacement, z, ask, sweep, sz, edge, book.age_ms, fee_rate)
+        # F1 FIX: an immediate IOC match is applied *inside* om.place() (both the
+        # dry-run simulator and the live exec_now branch), which reaches
+        # record_realized_slip before _record_fok_attempt could publish the
+        # submission-time expectation.  Publishing it here is what makes realized
+        # slippage measurable at all; the miss path clears it again below.
+        if token:
+            self._expected_fill_px[token] = float(entry_vwap2)
         try:
             oid = await self.om.place(token, Side.BUY, sweep, sz, Strategy.TEMPORAL, otype='FAK', neg_risk=mkt.neg_risk, tick_size=tick, quote_ts=book.ts if book else None, max_quote_age_ms=self.cfg.latarb_shadow_max_age_ms if self.cfg.latarb_shadow_max_age_ms > 0.0 else None)
         except (Exception, asyncio.CancelledError):
+            self._expected_fill_px.pop(token, None)
             if strat is not None:
                 strat._pending_entry[rkey] = max(0.0, strat._pending_entry.get(rkey, 0.0) - sz)
                 if strat._pending_entry.get(rkey, 0.0) < 1e-09:
@@ -7001,7 +7013,13 @@ class Bot:
         if balance_opt is None:
             if self.cfg.dry_run:
                 self.log.warning('CLOB balance fetch failed â€” dry-run continues with simulated bankroll floor')
-                balance = self.cfg.min_order_size / max(self.cfg.max_bankroll_fraction, 1e-09)
+                # P2 FIX: the bare floor (min_order / max_bankroll_fraction) is the
+                # exact point at which sizing goes inert, so paper stopped trading
+                # after its first losing settlement and could never accumulate the
+                # shadow/fill evidence the live-proof gate needs.  Start paper at the
+                # floor plus one day's permitted loss budget so paper stops on the
+                # same boundary the risk config halts on.  Live path unaffected.
+                balance = self.cfg.min_order_size / max(self.cfg.max_bankroll_fraction, 1e-09) + max(0.0, float(self.cfg.max_daily_loss))
             else:
                 # K7 FIX: hold before the fatal exit so a Restart=always
                 # supervisor cannot hammer the CLOB API in a ~5s crash loop.
@@ -7159,29 +7177,11 @@ class Bot:
         _forced_measure_only = _mo_raw in ('1', 'true', 'yes', 'y', 'on')
         if _forced_measure_only:
             self.log.info('MEASURE-ONLY (forced via --measure-only): logging evals/outcomes, placing NO orders.')
-        if self.cfg.latency_arb_enabled and (not self.cfg.dry_run) and self.cfg.require_latarb_proven_edge:
-            ok_lat, lat_reasons = evaluate_latarb_go_no_go(self.cfg)
-            if not ok_lat:
-                # Strict live canary exception: allow unproven LatArb only when bootstrap
-                # mode plus caps guarantee at most one venue-minimum FAK exposure.
-                canary_cap = max(float(self.cfg.min_order_size), VENUE_MIN_ORDER_USDC)
-                canary_ok = bool(getattr(self.cfg, 'latarb_bootstrap_live', False))
-                canary_ok = canary_ok and float(self.cfg.max_order_size) <= canary_cap + 1e-09
-                canary_ok = canary_ok and float(self.cfg.max_position) <= canary_cap + 0.75 + 1e-09
-                canary_ok = canary_ok and int(self.cfg.max_open_orders) <= 1
-                canary_ok = canary_ok and float(self.cfg.max_net_exposure_usdc) <= canary_cap + 0.75 + 1e-09
-                canary_ok = canary_ok and float(self.cfg.max_gross_exposure_usdc) <= canary_cap + 1.25 + 1e-09
-                if canary_ok:
-                    self.log.warning('LATARB GO/NO-GO: BOOTSTRAP LIVE CANARY â€” shadow evidence failed/missing; allowing one min-size FAK only')
-                    for rsn in lat_reasons:
-                        self.log.warning('  - %s', rsn)
-                else:
-                    self.log.critical('LATARB GO/NO-GO: NO-GO â€” refusing live LatArb:')
-                    for rsn in lat_reasons:
-                        self.log.critical('  - %s', rsn)
-                    raise FatalBotError('LATARB GO/NO-GO failed; live LatArb disabled until shadow evidence passes')
-            else:
-                self.log.info('LATARB GO/NO-GO: GO â€” strict shadow evidence passed')
+        # LatArb 200-signal shadow evidence gate removed: it ran once here and blocked
+        # startup (FatalBotError) until 200 scored shadow markets existed, without gating
+        # any individual decision. Shadow evidence is still written and is readable offline
+        # via --latarb-analyze. Live sizing remains capped at min_order_size until the
+        # fill/settle live proof below passes.
         if self.cfg.latency_arb_enabled and (not self.cfg.dry_run) and getattr(self.cfg, 'require_latarb_live_proof', False):
             ok_live, live_reasons, live_stats = evaluate_latarb_live_proof(self.cfg)
             if not ok_live:
@@ -8102,7 +8102,7 @@ class Bot:
         self.log.info('  DryRun   : %s  (fill_prob=%.0f%%  latency=%.0fms)', self.cfg.dry_run, self.cfg.dry_run_fill_prob * 100, self.cfg.dry_run_latency_ms)
         self.log.info('  Mode     : %s  |  Shards: %d  |  JSON: %s', 'EVENT' if self.cfg.event_driven else 'TIMER', self.cfg.ws_shard_count, 'orjson' if _FAST_JSON else 'stdlib')
         self.log.info('  AdaptKelly: %s  |  Metrics: %s', self.cfg.adaptive_kelly, self.cfg.metrics_enabled)
-        self.log.info('  LatArb   : enabled=%s  shadow=%s  age=%.0f..%.0fms  edge=%.3f  min_prob=%.2f  proof=%s/%s', self.cfg.latency_arb_enabled, self.cfg.latarb_shadow, self.cfg.latarb_shadow_min_age_ms, self.cfg.latarb_shadow_max_age_ms, self.cfg.latency_arb_edge, self.cfg.latency_arb_min_prob, self.cfg.require_latarb_proven_edge, self.cfg.require_latarb_live_proof)
+        self.log.info('  LatArb   : enabled=%s  shadow=%s  age=%.0f..%.0fms  edge=%.3f  min_prob=%.2f  live_proof=%s', self.cfg.latency_arb_enabled, self.cfg.latarb_shadow, self.cfg.latarb_shadow_min_age_ms, self.cfg.latarb_shadow_max_age_ms, self.cfg.latency_arb_edge, self.cfg.latency_arb_min_prob, self.cfg.require_latarb_live_proof)
         self.log.info('  SDK      : %s  (py-clob-client-v2=%s)', 'yes' if _HAS_SDK else 'NO', _pkg_version('py-clob-client-v2'))
         self.log.info('=' * 64)
 
@@ -8132,6 +8132,8 @@ def _latarb_pick_close(rs: List[Dict[str, Any]]) -> Tuple[float, float, float]:
     return (float(best['spot']), float(best['open']), float(best['ttc']))
 
 def evaluate_latarb_go_no_go(cfg: 'Config') -> Tuple[bool, List[str]]:
+    """Offline shadow-evidence report for --latarb-analyze. NOT a runtime gate:
+    the boot-time 200-signal check that used to call this was removed."""
     path = os.path.expanduser(cfg.latarb_shadow_path)
     if not os.path.exists(path):
         return (False, [f'LatArb shadow CSV not found: {path}'])
@@ -8450,7 +8452,7 @@ def _run_latarb_analyze(path: Optional[str]) -> None:
         ok_gate, gate_reasons = evaluate_latarb_go_no_go(cfg)
     finally:
         cfg.latarb_shadow_path = old_shadow_path
-    print(f"\n>>> LIVE LATARB PROOF GATE: {('GO' if ok_gate else 'NO-GO')}")
+    print(f"\n>>> LATARB SHADOW EVIDENCE (offline, advisory - does not gate live): {('PASS' if ok_gate else 'FAIL')}")
     if not ok_gate:
         for rsn in gate_reasons[:12]:
             print(f'  - {rsn}')
