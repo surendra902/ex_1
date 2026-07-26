@@ -6867,6 +6867,11 @@ class Bot:
         self._applied_trade_ids: Set[str] = set()
         self._applied_ioc_order: Deque[str] = deque(maxlen=10000)
         self._applied_ioc_order_ids: Set[str] = set()
+        # R8: coverage of the most recent drift check (-1 legs = never run /
+        # not verifiable). Boot revalidation refuses to clear a restored drift
+        # halt unless the latest check covered every leg with zero NaN reads.
+        self._last_drift_nan: int = -1
+        self._last_drift_legs: int = 0
         self._drift_io_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(self.cfg.drift_check_concurrency)), thread_name_prefix='drift-io')
 
     async def run(self) -> None:
@@ -7256,11 +7261,59 @@ class Bot:
         # a hot loop: the operator's 2026-07-25 session did this 2,944 times over
         # 17h and had 474 cancel_all calls rejected HTTP 429 by the venue. Exit
         # loudly with a dedicated status so the supervisor can stop instead.
+        # R8 FIX (the live blocker, 2026-07-26): a restored 'drift' halt was
+        # never re-checked, so a drift that no longer exists bricked every
+        # subsequent boot. Root cause of that day's incident: a FAK order that
+        # the venue matched for 5.1020 shares was booked locally as 0.0000
+        # shares, so local=0 vs chain=5.1020 tripped the drift halt; the halt
+        # was persisted and the supervisor then crash-looped 65 times. The
+        # booking defect is fixed upstream (zero matched_size now defers to
+        # REST/WS reconciliation), and the boot barrier already re-derives
+        # every on-chain position, so refusing on a STALE halt is pure
+        # downtime. Re-run the authoritative check instead:
+        #   * clear only when the fresh check covers EVERY leg (zero NaN
+        #     reads) and finds zero drift,
+        #   * keep the halt on any real drift, partial coverage or RPC error.
+        # A genuine data-integrity stop therefore still blocks startup.
+        if self.risk.halted and self.risk.status()['halt_type'] == 'drift' and (not self.cfg.dry_run) and self.client.sdk:
+            _saved = (self.risk._halted, self.risk._halt_type, self.risk._reason)
+            self.log.warning('Restored HALT [drift] - revalidating against on-chain balances before refusing to start...')
+            _cleared = False
+            for _attempt in range(1, 4):
+                self.risk._halted, self.risk._halt_type, self.risk._reason = (False, '', '')
+                try:
+                    _n_drift = await self._check_position_drift()
+                except Exception as _e:
+                    self.log.critical('drift revalidation attempt %d failed: %s', _attempt, _e)
+                    _n_drift = -1
+                _legs = int(getattr(self, '_last_drift_legs', 0))
+                _nan = int(getattr(self, '_last_drift_nan', -1))
+                if _n_drift == 0 and _legs > 0 and _nan == 0:
+                    _cleared = True
+                    break
+                if _n_drift > 0:
+                    self.log.critical('drift revalidation: %d leg(s) STILL drifting - halt stands', _n_drift)
+                    break
+                self.log.warning('drift revalidation attempt %d inconclusive (legs=%d nan=%d) - retrying', _attempt, _legs, _nan)
+                await asyncio.sleep(2.0)
+            if _cleared:
+                self.log.warning('Restored drift halt CLEARED: on-chain recheck covered %d leg(s) with 0 NaN and found no drift.', int(getattr(self, '_last_drift_legs', 0)))
+                self.risk._halted, self.risk._halt_type, self.risk._reason = (False, '', '')
+                try:
+                    self._save_runtime_state()
+                except Exception as _e:
+                    self.log.critical('could not persist cleared drift halt: %s', _e)
+                    raise
+            else:
+                if not self.risk.halted:
+                    self.risk._halted, self.risk._halt_type, self.risk._reason = _saved
+                self.log.critical('drift revalidation did NOT clear the halt - refusing to start.')
         if self.risk.halted:
             _st = self.risk.status()
             self.log.critical('REFUSING TO START: risk state restored as HALTED [%s]: %s', _st['halt_type'], _st['reason'])
             self.log.critical('  pnl=$%.2f day=$%.2f consec_losses=%d  state=%s', _st['pnl'], _st['daily'], _st['consec_losses'], self._state_path)
             self.log.critical('  daily_loss / consec_losses / drawdown halts clear themselves at the next daily reset.')
+            self.log.critical('  A drift halt is revalidated against the chain on every boot and clears itself once the chain agrees.')
             self.log.critical('  Any other halt type is a data-integrity stop: fix the cause, then delete the state file to re-arm.')
             raise SystemExit(EXIT_HALTED)
         active_by_id = {str(m.market_id): m for m in self.markets}
@@ -7273,7 +7326,22 @@ class Bot:
             _meta_values = list(self.fivemin._redeem_meta.values())
             _need_standard = any(not m.neg_risk for m in self.markets) or any(not bool(x.get('neg_risk')) for x in _meta_values)
             _need_neg = any(m.neg_risk for m in self.markets) or any(bool(x.get('neg_risk')) for x in _meta_values)
-            _redeem_ok, _redeem_reasons = await asyncio.get_running_loop().run_in_executor(None, self.redeemer.preflight, _need_standard, _need_neg)
+            # R8 FIX: preflight failures split into two very different classes.
+            # Missing CTF approvals are a real config stop. A Polygon RPC blip is
+            # not - and the operator's public RPC already timed out once during
+            # this boot sequence (2026-07-26 08:10:18). Treating a blip as fatal
+            # turns a 2-second outage into a supervisor crash loop, so retry the
+            # transient class only.
+            _RPC_TRANSIENT = ('RPC unavailable', 'preflight RPC error', 'chain_id=')
+            _redeem_ok, _redeem_reasons = (False, ['preflight not run'])
+            for _attempt in range(1, 4):
+                _redeem_ok, _redeem_reasons = await asyncio.get_running_loop().run_in_executor(None, self.redeemer.preflight, _need_standard, _need_neg)
+                if _redeem_ok:
+                    break
+                if not any(any(_m in _r for _m in _RPC_TRANSIENT) for _r in _redeem_reasons):
+                    break
+                self.log.warning('Redeem preflight attempt %d hit a transient RPC condition (%s) - retrying in %.0fs', _attempt, '; '.join(_redeem_reasons)[:160], 3.0 * _attempt)
+                await asyncio.sleep(3.0 * _attempt)
             if not _redeem_ok:
                 for _reason in _redeem_reasons:
                     self.log.critical('REDEEM PREFLIGHT: %s', _reason)
@@ -7731,6 +7799,9 @@ class Bot:
         return await self._on_fill(mkt, asset_id, side_raw, size, price, trade_id=trade_id, order_ids=order_ids, aggregate_ioc=bool(trade.get('_ioc_aggregate')))
 
     async def _check_position_drift(self) -> int:
+        # R8: mark coverage unknown until this run actually completes.
+        self._last_drift_nan = -1
+        self._last_drift_legs = 0
         if not self.client.sdk:
             return 0
         if self.cfg.dry_run:
@@ -7794,6 +7865,9 @@ class Bot:
             self.log.warning('drift check: %d/%d fetches returned NaN â€” coverage may be incomplete; if this persists, on-chain RPC is down', nan_count, len(results))
         if nan_count == len(results) and len(results) > 0:
             self.risk._halt(f'drift check: total RPC failure â€” all {len(results)} fetches returned NaN', halt_type='rpc')
+        # R8: publish coverage for boot-time revalidation.
+        self._last_drift_nan = int(nan_count)
+        self._last_drift_legs = len(results)
         if drift_count:
             self.risk._halt(f'position drift on {drift_count} market(s); first: {first_msg}', halt_type='drift')
         return drift_count
