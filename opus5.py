@@ -121,6 +121,15 @@ LATARB_KILL_WINDOW: int = 50
 LATARB_KILL_COOLDOWN_S: float = 900.0
 # Default taker-delay horizon (s) when order-latency metrics are cold.
 LATARB_DEFAULT_TAKER_DELAY_S: float = 0.25
+# R6 FIX: the settlement-oracle sign filter only vetoes an entry when the oracle
+# has moved against the lead feed by at least this fraction of the lead move.
+# The oracle lagging behind the lead (small or zero opposite displacement) is the
+# signal this strategy trades, not a reason to skip.  See the veto site for the
+# measurement that set this value.
+LATARB_ORACLE_VETO_LEAD_FRAC: float = 0.5
+# R6 FIX: process exit status used when the bot refuses to start because the
+# persisted risk state is halted. A supervisor must NOT restart on this code.
+EXIT_HALTED: int = 3
 # K7 FIX: hold this long before a fatal preflight exit (underfunded / balance
 # unverifiable) so a Restart=always supervisor cannot crash-loop every ~5s.
 FATAL_PREFLIGHT_HOLD_S: float = 600.0
@@ -5435,7 +5444,9 @@ def _restore_runtime_state(markets: List['Market'], strategy: 'FiveMinStrategy',
         risk._month_reset = time.monotonic() if month_age >= 30 * 86400.0 else time.monotonic() - month_age
         risk._consecutive_losses = 0 if day_age >= 86400.0 else int(rr.get('consecutive_losses', 0))
         halt_type = str(rr.get('halt_type') or '')
-        keep_halt = bool(rr.get('halted')) and not (day_age >= 86400.0 and halt_type in ('daily_loss', 'consec_losses'))
+        # R6 FIX: 'drawdown' expires with the day here too, matching Risk.ok().
+        # Without it a restored drawdown halt survived every restart forever.
+        keep_halt = bool(rr.get('halted')) and not (day_age >= 86400.0 and halt_type in ('daily_loss', 'consec_losses', 'drawdown'))
         risk._halted, risk._halt_type, risk._reason = keep_halt, halt_type if keep_halt else '', str(rr.get('reason') or '') if keep_halt else ''
     if trade_pnl_in_flight is not None:
         trade_pnl_in_flight.clear()
@@ -5822,7 +5833,17 @@ class LatencyArb:
         # Settlement-oracle sign agreement when fresh CL is available (basis filter).
         if oracle_px is not None and oracle_px > 0 and open_price > 0:
             o_disp = (float(oracle_px) - open_price) / open_price
-            if o_disp * displacement < 0.0:
+            # R6 FIX: the settlement oracle LAGS the lead feed, and that lag is
+            # the entire premise of this strategy, so a tiny opposite oracle
+            # wiggle is feed noise rather than a basis disagreement.  Measured
+            # on the operator's 2026-07-25 shadow log (536 scored evaluations):
+            # the strict `< 0.0` test vetoed 401 rows (74.8%) and made
+            # oracle_sign the largest skip bucket in the run (4,323 = 40.7% of
+            # all skips), yet in 100% of those vetoes the oracle had moved LESS
+            # than the lead (median 10.5%, max 84.3% of the lead move) — i.e.
+            # not one veto in the whole session was a genuine contradiction.
+            # Only veto when the oracle has moved materially against the lead.
+            if o_disp * displacement < 0.0 and abs(o_disp) >= LATARB_ORACLE_VETO_LEAD_FRAC * abs(displacement):
                 return self._skip_latarb('oracle_sign', '%s %s oracle sign disagrees lead: lead_disp=%+.5f oracle_disp=%+.5f', coin, mkt.market_id, displacement, o_disp)
         else:
             # N12 FIX: oracle feed stale/missing â€” cannot confirm displacement direction
@@ -6707,8 +6728,19 @@ class Risk:
         if time.monotonic() - self._day_reset > 86400:
             self._day_start = self._pnl
             self._day_reset = time.monotonic()
+            # R6 FIX: rebase the peak with the day. _pnl_peak used to be an
+            # all-time high-water mark while the cap it is compared against is a
+            # per-day allowance, so the drawdown test tightened forever as
+            # lifetime P&L grew and was guaranteed to halt eventually.
+            self._pnl_peak = self._pnl
             if self._halted:
-                if self._halt_type in ('daily_loss', 'consec_losses'):
+                # R6 FIX: 'drawdown' joins the auto-cleared set. It is a variance
+                # throttle like daily_loss/consec_losses, not a data-integrity
+                # fault (drift / fill_durability / capital_shock still require an
+                # operator). Leaving it out made one drawdown halt permanent: the
+                # operator's 2026-07-25 session halted at 12:10 while net +$1.77
+                # and then burned 17h in 2,944 boot->restore-halt->exit cycles.
+                if self._halt_type in ('daily_loss', 'consec_losses', 'drawdown'):
                     _cleared_type = self._halt_type
                     self._halted = False
                     self._reason = ''
@@ -6741,10 +6773,16 @@ class Risk:
             return False
         if self._pnl > self._pnl_peak:
             self._pnl_peak = self._pnl
-        if bankroll > 0.0 and self.cfg.max_daily_loss_pct > 0.0:
-            dd_cap = bankroll * self.cfg.max_daily_loss_pct
-        else:
-            dd_cap = self.cfg.max_drawdown_from_peak
+        # R6 FIX: the drawdown-from-peak cap used bankroll * max_daily_loss_pct,
+        # i.e. the exact same number as daily_cap above. Because give-back from a
+        # peak is always >= loss from the day's start, that made this test
+        # strictly tighter than the daily cap, rendered the daily cap and
+        # MAX_CONSECUTIVE_LOSSES unreachable, silently discarded the operator's
+        # own MAX_DRAWDOWN_FROM_PEAK setting, and halted *profitable* sessions:
+        # on 2026-07-25 the bot stopped at "Drawdown $4.12 from peak $5.88 (cap
+        # $2.73)" while the day was net +$1.77, because the cap ($2.73) was
+        # smaller than a single winning trade (+$2.96). Honour the dedicated key.
+        dd_cap = self.cfg.max_drawdown_from_peak
         if dd_cap > 0.0:
             dd = self._pnl_peak - self._pnl
             if dd > dd_cap:
@@ -7154,6 +7192,20 @@ class Bot:
                 self.log.error('STATE RECOVERY: %s', problem)
             if not self.cfg.dry_run:
                 raise FatalBotError('Live restart state is incomplete; refusing to trade')
+        # R6 FIX: refuse to finish booting into a restored halt. Previously the
+        # bot completed the whole boot (on-chain proxy verification, book
+        # seeding, feed subscriptions), then the first book update noticed the
+        # halt and shut it down again. Under a restarting supervisor that became
+        # a hot loop: the operator's 2026-07-25 session did this 2,944 times over
+        # 17h and had 474 cancel_all calls rejected HTTP 429 by the venue. Exit
+        # loudly with a dedicated status so the supervisor can stop instead.
+        if self.risk.halted:
+            _st = self.risk.status()
+            self.log.critical('REFUSING TO START: risk state restored as HALTED [%s]: %s', _st['halt_type'], _st['reason'])
+            self.log.critical('  pnl=$%.2f day=$%.2f consec_losses=%d  state=%s', _st['pnl'], _st['daily'], _st['consec_losses'], self._state_path)
+            self.log.critical('  daily_loss / consec_losses / drawdown halts clear themselves at the next daily reset.')
+            self.log.critical('  Any other halt type is a data-integrity stop: fix the cause, then delete the state file to re-arm.')
+            raise SystemExit(EXIT_HALTED)
         active_by_id = {str(m.market_id): m for m in self.markets}
         for _mid in _restored_mids:
             _m = active_by_id.get(str(_mid))
@@ -7397,6 +7449,13 @@ class Bot:
             m.book_no = book
         if self.risk.halted:
             if not self.shutdown_ev.is_set():
+                # R6 FIX: claim the shutdown before the first await. This handler
+                # runs once per book update on every subscribed token, so with
+                # the flag only set in the `finally` every concurrent callback
+                # already in flight passed the is_set() check and issued its own
+                # cancel_all. The operator's log shows the resulting burst (3,572
+                # cancel_all calls, 474 of them rejected HTTP 429 by the venue).
+                self.shutdown_ev.set()
                 if self.cfg.auto_flatten_on_halt:
                     try:
                         await self._flatten_all_positions()
@@ -7404,8 +7463,8 @@ class Bot:
                         self.log.error('auto_flatten_on_halt failed: %s', e)
                 try:
                     await self.om.cancel_all()
-                finally:
-                    self.shutdown_ev.set()
+                except Exception as e:
+                    self.log.error('cancel_all on halt failed: %s', e)
             return
         if not self.risk.ok():
             return
@@ -7832,7 +7891,17 @@ class Bot:
                     self.log.warning('Reconcile error: %s', e)
                 now_mono = time.monotonic()
                 force_bal = bool(self.fivemin is not None and getattr(self.fivemin, '_balance_force_refresh', False))
-                if force_bal or now_mono - last_bal_refresh >= self.cfg.balance_refresh_s:
+                # R6 FIX: the authoritative balance poll is live-only. In paper
+                # mode the ledger is simulated - buys debit _balance_cache and
+                # settlements credit it - so overwriting it with the real
+                # on-chain balance made the two accountings fight each other:
+                # every paper settlement raised free cash above the real balance
+                # and the next poll read that as an external debit. That is
+                # exactly the false "CAPITAL SHOCK: free cash $14.98 -> $9.10"
+                # in the operator's 2026-07-25 log, which cancelled resting buys
+                # and rebased sizing on a paper-only artefact. It also starved
+                # paper sizing between polls ("dry sizing inert").
+                if not self.cfg.dry_run and (force_bal or now_mono - last_bal_refresh >= self.cfg.balance_refresh_s):
                     last_bal_refresh = now_mono
                     try:
                         expected_gen = self.fivemin._balance_gen if self.fivemin is not None else None
