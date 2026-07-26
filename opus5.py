@@ -5579,6 +5579,9 @@ class LatencyArb:
         # First executable shadow candidate per market (independent of throttle spam).
         self._shadow_candidate_logged: Set[str] = set()
         self._traded_entries: Set[str] = set()
+        # R7: tokens the wallet already holds outside this bot's book (set by
+        # Bot._boot from the position-recovery barrier). Never entered.
+        self._external_tokens: Set[str] = set()
         self._shadow_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='latarb-shadow-io')
         self._measure_only = False
         self._measure_only_until: float = 0.0
@@ -5929,6 +5932,10 @@ class LatencyArb:
         if mkt.pos_yes.shares > 1e-06 or mkt.pos_no.shares > 1e-06:
             return self._skip_latarb('has_position')
         token = mkt.yes_token if up else mkt.no_token
+        # R7: the boot barrier no longer refuses to trade because the wallet holds
+        # inventory this bot's state does not own - it excludes those tokens instead.
+        if token in self._external_tokens:
+            return self._skip_latarb('external_inventory', 'token %s already held outside this bot\'s book', token[:16])
         if self.polyfeed and time.monotonic() < self.polyfeed._last_large_trade_ts.get(token, 0.0) + self.cfg.whale_cooldown_s:
             return self._skip_latarb('whale_cooldown')
         if self.cfg.adverse_select_gate:
@@ -6831,6 +6838,10 @@ class Bot:
         self._state_identity: Optional[dict] = None
         self._state_path: str = ''
         self._loaded_state: dict = {}
+        # R7: token -> shares held by the trading wallet at boot that this bot's state
+        # does not own (settled dust or inventory from an earlier/other session).
+        # Excluded from the ledger, subtracted in the drift check, blocked for entry.
+        self._external_positions: Dict[str, float] = {}
         self.binance = BinanceFeed(cfg.coins)
         self.chainlink = ChainlinkFeed(cfg.coins)
         self.polyfeed = HyperPolyFeed(shard_count=cfg.ws_shard_count)
@@ -6969,7 +6980,7 @@ class Bot:
                 if token:
                     expected[token] = max(0.0, expected.get(token, 0.0) - float(amount))
         expected = {token: shares for token, shares in expected.items() if shares >= max(1e-06, self.cfg.drift_halt_threshold_shares)}
-        remote: Dict[str, Tuple[float, str]] = {}
+        remote: Dict[str, Tuple[float, str, bool]] = {}
         offset = 0
         while offset < 5000:
             try:
@@ -6992,7 +7003,22 @@ class Bot:
                 except (TypeError, ValueError):
                     raise FatalBotError(f'Live position recovery: malformed size for token {token[:16]}')
                 if token and shares >= self.cfg.drift_halt_threshold_shares:
-                    remote[token] = (shares, str(row.get('conditionId') or row.get('condition_id') or ''))
+                    # R7 FIX (classification): a row the Data API reports as
+                    # redeemable with curPrice == 0 and currentValue == 0 is a
+                    # SETTLED LOSER. Its size can never change again, it cannot be
+                    # traded or sold, and it carries no exposure - it simply sits in
+                    # the wallet until someone pays gas to redeem $0. Measured on the
+                    # operator's wallet 2026-07-26: 294 of 294 remote rows were exactly
+                    # this (all curPrice 0, all redeemable, $425.64 initial value,
+                    # end dates June-July 2026), and every one of them was counted as a
+                    # state mismatch below and blocked all trading.
+                    try:
+                        cur_px = float(row.get('curPrice') or 0.0)
+                        cur_val = float(row.get('currentValue') or 0.0)
+                    except (TypeError, ValueError):
+                        cur_px, cur_val = (1.0, 1.0)  # unparseable => treat as live, never as dust
+                    settled = bool(row.get('redeemable')) and cur_px <= 0.0 and (cur_val <= 0.0)
+                    remote[token] = (shares, str(row.get('conditionId') or row.get('condition_id') or ''), settled)
             if len(payload) < 500:
                 break
             offset += 500
@@ -7000,22 +7026,52 @@ class Bot:
             raise FatalBotError('Live position recovery: more than 5000 positions; pagination bound exceeded')
         mismatches: List[str] = []
         tolerance = max(1e-06, self.cfg.drift_halt_threshold_shares)
-        for token, (shares, cond) in remote.items():
+        external: Dict[str, float] = {}
+        settled_tokens: Set[str] = set()
+        settled_shares = 0.0
+        for token, (shares, cond, settled) in remote.items():
             local = expected.get(token)
             if local is None:
-                mismatches.append(f'unowned remote token {token[:16]} shares={shares:.6f} condition={cond[:18]}')
-            elif abs(local - shares) >= tolerance:
+                # R7 FIX (the live blocker): a remote token this bot's state does not
+                # know about is PRE-EXISTING WALLET INVENTORY, not proof that the book
+                # is corrupt. Treating it as fatal bricks the bot permanently on any
+                # wallet with trading history - and the documented recovery for a risk
+                # halt ("delete the state file to re-arm") creates exactly that state.
+                # On 2026-07-26 this refused every order for 294 worthless settled
+                # positions and crash-looped every 5s.
+                # Booting instead is safe for this build: it never sells, so it cannot
+                # dispose of inventory it does not know about; the tokens are excluded
+                # from the ledger, from the drift comparison, and blocked for entry.
+                external[token] = shares
+                if settled:
+                    settled_tokens.add(token)
+                    settled_shares += shares
+                continue
+            if abs(local - shares) >= tolerance:
                 mismatches.append(f'token {token[:16]} state={local:.6f} remote={shares:.6f}')
             elif expected_cond.get(token) and cond and expected_cond[token].lower() != cond.lower():
                 mismatches.append(f'token {token[:16]} condition mismatch state={expected_cond[token][:18]} remote={cond[:18]}')
         for token, shares in expected.items():
             if shares >= tolerance and token not in remote:
                 mismatches.append(f'persisted token {token[:16]} shares={shares:.6f} absent remotely')
+        self._external_positions = dict(external)
+        live_external = {t: s for t, s in external.items() if t not in settled_tokens}
+        if settled_tokens:
+            self.log.info('Position recovery: %d settled worthless position(s) ignored (%.4f shares, curPrice 0, redeemable, $0 value) - not tradable, no exposure', len(settled_tokens), settled_shares)
+        if live_external:
+            for token, shares in sorted(live_external.items(), key=lambda kv: -kv[1])[:20]:
+                self.log.warning('POSITION RECOVERY: unowned LIVE remote token %s shares=%.6f - kept out of the ledger, entry blocked this session', token[:16], shares)
+            self.log.warning('Position recovery: %d unowned LIVE position(s) exist in the wallet. Their P&L is NOT tracked by this bot and it will not trade those tokens.', len(live_external))
         if mismatches:
             for mismatch in mismatches[:20]:
                 self.log.critical('POSITION RECOVERY MISMATCH: %s', mismatch)
+            # R7: these are genuine own-book disagreements (a token the state claims,
+            # with a different remote size, or absent remotely). A restart cannot fix
+            # one, so hold before exiting instead of feeding a 5s supervisor crash loop.
+            self.log.critical('Own-book disagreement with the venue on %d token(s); refusing any order. Holding %.0fs before exit to avoid a supervisor crash loop.', len(mismatches), FATAL_PREFLIGHT_HOLD_S)
+            await asyncio.sleep(FATAL_PREFLIGHT_HOLD_S)
             raise FatalBotError(f'Live position recovery failed with {len(mismatches)} mismatch(es); refusing any order')
-        self.log.info('Live position recovery barrier OK: %d remote position(s), %d persisted position(s)', len(remote), len(expected))
+        self.log.info('Live position recovery barrier OK: %d remote position(s) (%d settled dust, %d unowned live), %d persisted position(s)', len(remote), len(settled_tokens), len(live_external), len(expected))
 
     async def _boot(self) -> None:
         self._banner()
@@ -7177,6 +7233,7 @@ class Bot:
         self.latency_arb = LatencyArb(self.cfg, self.om, self.tracker, self.polyfeed, self.by_coin)
         self.latency_arb.risk = self.risk
         self.latency_arb.strategy = self.fivemin
+        self.latency_arb._external_tokens = set(self._external_positions)
         self.fivemin.redeemer = self.redeemer
         _n_hold, _restored_mids, _state_problems = _restore_runtime_state(self.markets, self.fivemin, self.risk, self.redeemer, self.om, self.cfg.dry_run, self._loaded_state, self._trade_pnl_in_flight, self._applied_trade_order, self._applied_ioc_order)
         self._applied_trade_ids = set(self._applied_trade_order)
@@ -7719,11 +7776,17 @@ class Bot:
             if not math.isfinite(chain_shares):
                 nan_count += 1
                 continue
-            diff = abs(local_shares - chain_shares)
+            # R7: the on-chain balance includes any pre-existing wallet inventory the
+            # boot barrier classified as external, so compare like with like. Without
+            # this, external inventory in a market the bot later tracks fires the
+            # 'drift' halt, which never auto-clears.
+            own_chain_shares = max(0.0, chain_shares - self._external_positions.get(tid, 0.0))
+            diff = abs(local_shares - own_chain_shares)
             if diff >= threshold:
                 drift_count += 1
-                direction = 'OVER' if local_shares > chain_shares else 'UNDER'
-                msg = f'POSITION DRIFT mkt={mkt.market_id[:8]} {side_label} local={local_shares:.4f} chain={chain_shares:.4f} diff={diff:.4f} ({direction})'
+                direction = 'OVER' if local_shares > own_chain_shares else 'UNDER'
+                _ext = self._external_positions.get(tid, 0.0)
+                msg = f'POSITION DRIFT mkt={mkt.market_id[:8]} {side_label} local={local_shares:.4f} chain={own_chain_shares:.4f} diff={diff:.4f} ({direction})' + (f' [chain_total={chain_shares:.4f} external={_ext:.4f}]' if _ext > 0.0 else '')
                 self.log.critical(msg)
                 if not first_msg:
                     first_msg = msg
