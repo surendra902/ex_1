@@ -133,6 +133,47 @@ EXIT_HALTED: int = 3
 # K7 FIX: hold this long before a fatal preflight exit (underfunded / balance
 # unverifiable) so a Restart=always supervisor cannot crash-loop every ~5s.
 FATAL_PREFLIGHT_HOLD_S: float = 600.0
+# R9 FIX (2026-07-26): the 08:49 restart loop could not be diagnosed at all,
+# because ~/opus5.log held only the supervisor's own "Bot exited" echo lines while
+# every bot message goes to sys.stdout, which that supervisor sent elsewhere. Two
+# consequences are unacceptable for a live trading process: the exit reason was
+# invisible, and there was no way to tell WHICH build was running (the 07-26
+# incident was already mis-diagnosed once because the host ran an older binary
+# than the repo). Fix: one dependency-free record written with an explicit flush
+# to a dedicated file AND to stderr, so it survives block-buffered stdout, an
+# unknown supervisor redirection, and death by signal (OOM/SIGKILL) alike.
+BOOT_RECORD_PATH: str = os.path.expanduser(os.environ.get('BOOT_RECORD_PATH', '~/polybot_boot.log'))
+# R9: NaN legs in the drift sweep are retried serially rather than re-swept.
+DRIFT_NAN_RETRY_ROUNDS: int = 3
+DRIFT_NAN_RETRY_DELAY_S: float = 0.75
+
+def _build_fingerprint() -> str:
+    """sha256[:12] of this source file - proves which binary is actually running."""
+    try:
+        with open(os.path.abspath(__file__), 'rb') as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:12]
+    except Exception:
+        return 'unknown'
+_BUILD_FINGERPRINT: str = _build_fingerprint()
+
+def boot_record(event: str, detail: str='') -> None:
+    """Append one durable, flushed line describing a boot/exit event. Never raises."""
+    stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    line = f'[{stamp}] pid={os.getpid()} build={_BUILD_FINGERPRINT} {event}'
+    if detail:
+        line += f' | {detail}'
+    try:
+        sys.stderr.write(line + '\n')
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        with open(BOOT_RECORD_PATH, 'a', encoding='utf-8') as fh:
+            fh.write(line + '\n')
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:
+        pass
 
 class FatalBotError(RuntimeError):
     pass
@@ -7275,9 +7316,14 @@ class Bot:
         #     reads) and finds zero drift,
         #   * keep the halt on any real drift, partial coverage or RPC error.
         # A genuine data-integrity stop therefore still blocks startup.
-        if self.risk.halted and self.risk.status()['halt_type'] == 'drift' and (not self.cfg.dry_run) and self.client.sdk:
+        # R9 FIX: an 'rpc' halt means "every balance read failed", which is by
+        # definition a transient condition - and it is raised by the very check this
+        # block re-runs. Leaving it out of the revalidation set meant one venue blip
+        # produced a permanently unbootable state, the same defect R8 fixed for
+        # 'drift'. Both are now revalidated by the same authoritative sweep.
+        if self.risk.halted and self.risk.status()['halt_type'] in ('drift', 'rpc') and (not self.cfg.dry_run) and self.client.sdk:
             _saved = (self.risk._halted, self.risk._halt_type, self.risk._reason)
-            self.log.warning('Restored HALT [drift] - revalidating against on-chain balances before refusing to start...')
+            self.log.warning('Restored HALT [%s] - revalidating against on-chain balances before refusing to start...', _saved[1])
             _cleared = False
             for _attempt in range(1, 4):
                 self.risk._halted, self.risk._halt_type, self.risk._reason = (False, '', '')
@@ -7305,16 +7351,47 @@ class Bot:
                     self.log.critical('could not persist cleared drift halt: %s', _e)
                     raise
             else:
-                if not self.risk.halted:
-                    self.risk._halted, self.risk._halt_type, self.risk._reason = _saved
-                self.log.critical('drift revalidation did NOT clear the halt - refusing to start.')
+                # R9 FIX: always restore the ORIGINAL halt. _check_position_drift can
+                # itself halt with halt_type='rpc' when every leg returns NaN, and the
+                # old `if not self.risk.halted` guard then left that substituted halt
+                # in place. The operator was shown 'rpc' instead of the real restored
+                # cause, and the reason string of the genuine stop was destroyed.
+                _fresh = self.risk.status() if self.risk.halted else None
+                self.risk._halted, self.risk._halt_type, self.risk._reason = _saved
+                if _fresh is not None and str(_fresh.get('halt_type') or '') != _saved[1]:
+                    self.log.critical('halt revalidation also observed a fresh [%s] condition: %s', _fresh.get('halt_type'), _fresh.get('reason'))
+                self.log.critical('halt revalidation did NOT clear the halt - refusing to start.')
+        # R9 FIX: 'capital_shock' is the second halt type the 07-26 incident produced
+        # (07:55:19) and it never self-clears either, so it bricks every subsequent
+        # boot exactly the way the drift halt did. It is revalidatable: re-evaluate
+        # the halt's OWN predicate against the authoritative balance and exposure
+        # this boot has already loaded. Clear only when BOTH legs of that predicate
+        # now pass. This is a like-for-like re-test, not a relaxation - if capital is
+        # still missing or inventory is still over the gross cap, the halt stands.
+        if self.risk.halted and self.risk.status()['halt_type'] == 'capital_shock' and (not self.cfg.dry_run) and (self.fivemin is not None):
+            _free = max(0.0, float(self.fivemin.free_cash()))
+            _gross = float(self.fivemin._gross_exposure)
+            _net_cap, _gross_cap = self.fivemin.exposure_caps()
+            _sizeable = _free * self.cfg.max_bankroll_fraction >= self.cfg.min_order_size
+            _within_cap = _gross <= _gross_cap + 1e-09
+            if _sizeable and _within_cap:
+                self.log.warning('Restored capital_shock halt CLEARED: free=$%.2f x frac %.2f >= min_order $%.2f, and gross=$%.2f <= cap $%.2f.', _free, self.cfg.max_bankroll_fraction, self.cfg.min_order_size, _gross, _gross_cap)
+                self.risk._halted, self.risk._halt_type, self.risk._reason = (False, '', '')
+                try:
+                    self._save_runtime_state()
+                except Exception as _e:
+                    self.log.critical('could not persist cleared capital_shock halt: %s', _e)
+                    raise
+            else:
+                self.log.critical('capital_shock revalidation: free=$%.2f gross=$%.2f gross_cap=$%.2f sizeable=%s within_cap=%s - halt stands.', _free, _gross, _gross_cap, _sizeable, _within_cap)
         if self.risk.halted:
             _st = self.risk.status()
             self.log.critical('REFUSING TO START: risk state restored as HALTED [%s]: %s', _st['halt_type'], _st['reason'])
             self.log.critical('  pnl=$%.2f day=$%.2f consec_losses=%d  state=%s', _st['pnl'], _st['daily'], _st['consec_losses'], self._state_path)
             self.log.critical('  daily_loss / consec_losses / drawdown halts clear themselves at the next daily reset.')
-            self.log.critical('  A drift halt is revalidated against the chain on every boot and clears itself once the chain agrees.')
+            self.log.critical('  drift / rpc / capital_shock halts are revalidated on every boot and clear themselves once the fresh check agrees.')
             self.log.critical('  Any other halt type is a data-integrity stop: fix the cause, then delete the state file to re-arm.')
+            boot_record(f'EXIT rc={EXIT_HALTED} REFUSING TO START', f"halt_type={_st['halt_type']} reason={_st['reason']}")
             raise SystemExit(EXIT_HALTED)
         active_by_id = {str(m.market_id): m for m in self.markets}
         for _mid in _restored_mids:
@@ -7840,6 +7917,36 @@ class Bot:
                 except Exception:
                     return float('nan')
         results = await asyncio.gather(*(_fetch_one(meta[1]) for meta in tasks_meta), return_exceptions=False)
+        # R9 FIX (2026-07-26): retry the legs that came back NaN, one at a time.
+        # NaN here does not mean "no position" - it means "we failed to look" (the
+        # CLOB balance-allowance call raised, or returned a non-dict). The 07-26 log
+        # measured 3/30 NaN reads at DRIFT_CHECK_CONCURRENCY=4: a ~10% per-leg
+        # failure rate, consistent with venue rate limiting rather than an outage.
+        # Two consequences, both fixed here:
+        #   * the runtime drift check had a silent blind spot on ~10% of legs, and
+        #   * the boot-time revalidation below demands FULL coverage (0 NaN), which a
+        #     24-leg sweep at a 10% per-leg failure rate clears only ~8% of the time,
+        #     so a stale halt could survive an unbounded number of restarts.
+        # Serial retries with backoff converge instead of gambling on a clean sweep.
+        # When the first sweep is already clean, this block is a no-op.
+        results = list(results)
+        _nan_idx = [i for i, v in enumerate(results) if not math.isfinite(v)]
+        if _nan_idx:
+            _initial_nan = len(_nan_idx)
+            for _round in range(1, DRIFT_NAN_RETRY_ROUNDS + 1):
+                await asyncio.sleep(DRIFT_NAN_RETRY_DELAY_S * _round)
+                _still: List[int] = []
+                for _i in _nan_idx:
+                    _v = await _fetch_one(tasks_meta[_i][1])
+                    if math.isfinite(_v):
+                        results[_i] = _v
+                    else:
+                        _still.append(_i)
+                self.log.info('drift check: NaN retry round %d recovered %d/%d leg(s)', _round, len(_nan_idx) - len(_still), len(_nan_idx))
+                _nan_idx = _still
+                if not _nan_idx:
+                    break
+            self.log.info('drift check: NaN retries finished - %d of %d initially-unread leg(s) still unread', len(_nan_idx), _initial_nan)
         drift_count = 0
         nan_count = 0
         first_msg = ''
@@ -8310,6 +8417,8 @@ class Bot:
         self.log.info('  AdaptKelly: %s  |  Metrics: %s', self.cfg.adaptive_kelly, self.cfg.metrics_enabled)
         self.log.info('  LatArb   : enabled=%s  shadow=%s  age=%.0f..%.0fms  edge=%.3f  min_prob=%.2f  live_proof=%s', self.cfg.latency_arb_enabled, self.cfg.latarb_shadow, self.cfg.latarb_shadow_min_age_ms, self.cfg.latarb_shadow_max_age_ms, self.cfg.latency_arb_edge, self.cfg.latency_arb_min_prob, self.cfg.require_latarb_live_proof)
         self.log.info('  SDK      : %s  (py-clob-client-v2=%s)', 'yes' if _HAS_SDK else 'NO', _pkg_version('py-clob-client-v2'))
+        # R9: quote this when reporting a problem - it identifies the exact binary.
+        self.log.info('  Build    : %s  (sha256[:12] of this source file)', _BUILD_FINGERPRINT)
         self.log.info('=' * 64)
 
 def _run_analyze(path: Optional[str]) -> None:
@@ -8696,17 +8805,20 @@ def main() -> None:
         log.info('uvloop active (libuv event loop)')
     except ImportError:
         log.info('uvloop not installed â€” using stdlib asyncio loop')
+    boot_record('BOOT start', f"argv={' '.join(sys.argv[1:]) or '(none)'}")
     cfg = Config.from_env()
     errs = cfg.validate()
     if errs:
         for e in errs:
             print(f'ERROR: {e}')
+        boot_record('EXIT rc=1', 'config validation failed: ' + '; '.join(str(e) for e in errs))
         sys.exit(1)
     global _PROCESS_INSTANCE_LOCK
     try:
         _PROCESS_INSTANCE_LOCK = acquire_instance_lock(cfg)
     except FatalBotError as e:
         logging.getLogger('Bot').critical('%s', e)
+        boot_record('EXIT rc=1', f'instance lock: {e}')
         sys.exit(1)
     if cfg.proxy_address:
         log.info('Proxy  : %s', cfg.proxy_address)
@@ -8715,10 +8827,18 @@ def main() -> None:
     log.info('SigType: %d (%s)', cfg.signature_type, _SIG_LABELS.get(cfg.signature_type, '?'))
     try:
         asyncio.run(Bot(cfg).run())
+        boot_record('EXIT rc=0', 'run() returned normally')
     except KeyboardInterrupt:
         print('\nStopped.')
+        boot_record('EXIT rc=0', 'KeyboardInterrupt')
+    except SystemExit as e:
+        # R9: EXIT_HALTED and friends are BaseException - they bypass the handler
+        # below, which is why an exit-3 refusal previously left no durable trace.
+        boot_record(f'EXIT rc={e.code}', 'refused to start - see the bot log for the halt reason')
+        raise
     except Exception as e:
         logging.getLogger('Bot').critical('Fatal: %s', e, exc_info=True)
+        boot_record('EXIT rc=1', f'{type(e).__name__}: {e}')
         sys.exit(1)
 if __name__ == '__main__':
     main()
