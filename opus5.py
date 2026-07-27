@@ -127,6 +127,13 @@ LATARB_DEFAULT_TAKER_DELAY_S: float = 0.25
 # signal this strategy trades, not a reason to skip.  See the veto site for the
 # measurement that set this value.
 LATARB_ORACLE_VETO_LEAD_FRAC: float = 0.5
+# R16 FIX: paper mode only.  A resolved market whose winner cannot be proven
+# from oracle history (the bot booted after the interval closed) is flat-closed
+# at cost once it is this stale, so paper inventory and capital recycle instead
+# of accumulating zombie positions.  Live settlement is never estimated.
+DRY_STALE_SETTLE_S: float = float(os.environ.get('DRY_STALE_SETTLE_S', '600'))
+# R17 FIX: seconds between repeats of the 'settlement retained' notice per market.
+RETAINED_SETTLE_LOG_S: float = 300.0
 # R6 FIX: process exit status used when the bot refuses to start because the
 # persisted risk state is halted. A supervisor must NOT restart on this code.
 EXIT_HALTED: int = 3
@@ -143,6 +150,8 @@ FATAL_PREFLIGHT_HOLD_S: float = 600.0
 # to a dedicated file AND to stderr, so it survives block-buffered stdout, an
 # unknown supervisor redirection, and death by signal (OOM/SIGKILL) alike.
 BOOT_RECORD_PATH: str = os.path.expanduser(os.environ.get('BOOT_RECORD_PATH', '~/polybot_boot.log'))
+# R10: retry cadence for a boot reconciliation deferred by a Polygon RPC outage.
+REDEEM_RECONCILE_RETRY_S: float = 60.0
 # R9: NaN legs in the drift sweep are retried serially rather than re-swept.
 DRIFT_NAN_RETRY_ROUNDS: int = 3
 DRIFT_NAN_RETRY_DELAY_S: float = 0.75
@@ -178,28 +187,59 @@ def boot_record(event: str, detail: str='') -> None:
 class FatalBotError(RuntimeError):
     pass
 
+def _env_float(name: str, default: float) -> float:
+    """Module-level env read for knobs used before Config exists. Never raises."""
+    try:
+        raw = (os.environ.get(name) or '').strip()
+        return float(raw) if raw else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+def _env_str(name: str, default: str='') -> str:
+    return (os.environ.get(name) or '').strip() or default
+
 def acquire_instance_lock(cfg: 'Config') -> Any:
     identity = cfg.proxy_address or hashlib.sha256((cfg.private_key or 'dry-run').encode()).hexdigest()[:16]
     safe = re.sub('[^A-Za-z0-9_.-]+', '_', identity)[:80] or 'default'
     lock_dir = os.path.expanduser('~')
     path = os.path.join(lock_dir, f'polybot_{safe}.lock')
     fh = open(path, 'a+', encoding='utf-8')
-    try:
-        if os.name == 'nt':
-            fh.seek(0, os.SEEK_END)
-            if fh.tell() == 0:
-                fh.write('0')
-                fh.flush()
-            fh.seek(0)
-            _file_lock_mod.locking(fh.fileno(), _file_lock_mod.LK_NBLCK, 1)
-        else:
-            _file_lock_mod.flock(fh.fileno(), _file_lock_mod.LOCK_EX | _file_lock_mod.LOCK_NB)
-    except OSError as exc:
+    # R10 FIX: the old lock was strictly non-blocking, so a supervisor that
+    # restarts every 5s raced the *dying* previous process and printed
+    # "Another instance is already running" on every other boot - noise that hid
+    # the real fault in the 2026-07-26 log.  Wait a bounded interval for the
+    # predecessor to release, then fail with the holder's pid so a genuine
+    # double-start is still obvious.
+    deadline = time.monotonic() + max(0.0, _env_float('INSTANCE_LOCK_WAIT_S', 20.0))
+    last_exc: Optional[BaseException] = None
+    while True:
         try:
-            fh.close()
-        except Exception:
-            pass
-        raise FatalBotError(f'Another Polymarket bot instance is already running for {identity}; stop it before starting this process') from exc
+            if os.name == 'nt':
+                fh.seek(0, os.SEEK_END)
+                if fh.tell() == 0:
+                    fh.write('0')
+                    fh.flush()
+                fh.seek(0)
+                _file_lock_mod.locking(fh.fileno(), _file_lock_mod.LK_NBLCK, 1)
+            else:
+                _file_lock_mod.flock(fh.fileno(), _file_lock_mod.LOCK_EX | _file_lock_mod.LOCK_NB)
+            break
+        except OSError as exc:
+            last_exc = exc
+            if time.monotonic() >= deadline:
+                holder = ''
+                try:
+                    fh.seek(0)
+                    holder = (fh.readline() or '').strip()
+                except Exception:
+                    pass
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                detail = f' (lock held by {holder})' if holder else ''
+                raise FatalBotError(f'Another Polymarket bot instance is already running for {identity}{detail}; stop it before starting this process') from last_exc
+            time.sleep(0.5)
     fh.seek(0)
     fh.truncate()
     fh.write(f'pid={os.getpid()} started={datetime.now(timezone.utc).isoformat()}\n')
@@ -650,22 +690,112 @@ def _pkg_version(name: str) -> str:
     except Exception:
         return 'unknown'
 
+# --- Polygon RPC endpoint pool (R10 FIX, 2026-07-26) --------------------------
+# ROOT CAUSE of the 09:39-09:47 crash loop: the bot resolved Polygon through ONE
+# hard-configured endpoint.  https://polygon-rpc.com still answers GET / with
+# HTTP 200 but now answers every JSON-RPC POST with
+#     HTTP 403 {"error":"API key disabled, reason: tenant disabled", code -32051}
+# so Web3.is_connected() returned False -> RedemptionEngine._init_web3() failed
+# -> boot receipt reconciliation raised -> FatalBotError -> supervisor restart
+# every 5s forever.  A read-only Polygon RPC carries no per-account state, so any
+# healthy endpoint is an exact substitute.  Every RPC user in this file now goes
+# through this pool: configured URL first, then POLYGON_RPC_FALLBACKS from the
+# environment, then the verified public defaults below.
+# Verified reachable 2026-07-26 (eth_chainId -> 0x89): publicnode, drpc, 1rpc.
+# Verified DEAD the same day: polygon-rpc.com (403), polygon.llamarpc.com (no
+# route), rpc.ankr.com/polygon (401, key required) - the last two were in the old
+# proxy-lookup list and were the reason the 8s proxy lookup timed out.
+_POLYGON_RPC_DEFAULTS: Tuple[str, ...] = ('https://polygon-bor-rpc.publicnode.com', 'https://polygon.drpc.org', 'https://1rpc.io/matic', 'https://polygon-rpc.com')
+# Endpoints that are provably dead for anonymous use; never auto-tried.  A user
+# who configures one explicitly still gets it (it stays first in the list).
+_POLYGON_RPC_DENYLIST: Tuple[str, ...] = ('https://polygon.llamarpc.com', 'https://rpc.ankr.com/polygon')
+
+def _polygon_rpc_candidates(primary: str='') -> List[str]:
+    """Ordered, de-duplicated RPC list: configured -> env fallbacks -> defaults."""
+    out: List[str] = []
+    env_extra = os.environ.get('POLYGON_RPC_FALLBACKS', '') or ''
+    for url in [primary] + [u for u in env_extra.split(',')] + list(_POLYGON_RPC_DEFAULTS):
+        u = (url or '').strip().rstrip('/')
+        if not u or u in out:
+            continue
+        if u in _POLYGON_RPC_DENYLIST and u != (primary or '').strip().rstrip('/'):
+            continue
+        out.append(u)
+    return out
+
+def _probe_polygon_rpc(url: str, chain_id: int, timeout: float) -> Optional[Web3]:
+    """Return a Web3 bound to url only if it answers a real JSON-RPC POST on the
+    expected chain.  is_connected() alone is not enough: a proxy can serve the
+    handshake and 403 the calls (exactly what polygon-rpc.com does now)."""
+    w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': timeout}))
+    if int(w3.eth.chain_id) != int(chain_id):
+        raise RuntimeError(f'chain_id {w3.eth.chain_id} != expected {chain_id}')
+    return w3
+
+def _connect_polygon_rpc(chain_id: int=137, primary: str='', timeout: float=8.0, rounds: int=2, log: Optional[logging.Logger]=None, exclude: Optional[Set[str]]=None) -> Tuple[Optional[Web3], str, List[str]]:
+    """Try every candidate endpoint (rounds passes, short backoff between passes).
+    Returns (web3_or_None, winning_url, per-endpoint failure strings)."""
+    candidates = [u for u in _polygon_rpc_candidates(primary) if u not in (exclude or set())]
+    if not candidates:
+        return (None, '', ['all candidate endpoints excluded'])
+    errors: List[str] = []
+    for attempt in range(max(1, int(rounds))):
+        for url in candidates:
+            try:
+                w3 = _probe_polygon_rpc(url, chain_id, timeout)
+                if w3 is not None:
+                    if log is not None and (attempt or url != candidates[0]):
+                        log.warning('Polygon RPC failover: using %s (primary %s unavailable)', url, candidates[0])
+                    return (w3, url, errors)
+            except Exception as e:
+                msg = f'{url}: {str(e)[:120]}'
+                if msg not in errors:
+                    errors.append(msg)
+        if attempt + 1 < max(1, int(rounds)):
+            time.sleep(1.5 * (attempt + 1))
+    return (None, '', errors)
+
+_RPC_TRANSPORT_MARKERS: Tuple[str, ...] = ('connection', 'timeout', 'timed out', 'max retries', 'temporarily unavailable', 'service unavailable', 'bad gateway', 'gateway time-out', 'too many requests', 'tenant disabled', 'api key', 'unauthorized', 'forbidden', '403', '429', '500', '502', '503', '504', 'ssl', 'name or service not known', 'nodename nor servname')
+
+def _is_rpc_transport_error(exc: BaseException) -> bool:
+    """True for endpoint/transport faults (rotate provider), False for logic errors
+    such as 'condition is not resolved on-chain yet' (rotating would not help)."""
+    text = f'{type(exc).__name__}: {exc}'.lower()
+    return any((marker in text for marker in _RPC_TRANSPORT_MARKERS))
+
+class RedemptionRPCUnavailable(RuntimeError):
+    """No Polygon RPC endpoint is currently usable. Transient and retryable -
+    must never be treated as a data-integrity fault."""
+
 def _lookup_proxy_address(eoa: str, chain_id: int=137) -> Optional[str]:
     eoa_cs = Web3.to_checksum_address(eoa)
     FACTORIES = [('0xaB45c5A4B0c941a2F231C04C3f49182e1A254052', 'getProxy'), ('0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E', 'getProxyAddress'), ('0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E', 'getSafeAddress')]
-    RPC_URLS = ['https://polygon-rpc.com', 'https://rpc.ankr.com/polygon', 'https://polygon.llamarpc.com', 'https://polygon.drpc.org']
-    for factory_addr, fn_name in FACTORIES:
-        ABI = [{'inputs': [{'name': '_owner', 'type': 'address'}], 'name': fn_name, 'outputs': [{'name': '', 'type': 'address'}], 'stateMutability': 'view', 'type': 'function'}]
-        for rpc in RPC_URLS:
+    # R10 FIX: the old shape was factories x endpoints with a 5s timeout each and
+    # two dead endpoints in the list, so a single lookup could burn well past the
+    # caller's 8s budget and always ended in 'Proxy lookup timed out'.  Pick ONE
+    # healthy endpoint from the pool first, then run the three cheap view calls
+    # on it; only rotate if that endpoint itself fails.
+    bad: Set[str] = set()
+    for _ in range(2):
+        w3, rpc, _errors = _connect_polygon_rpc(chain_id=chain_id, primary=os.environ.get('POLYGON_RPC_URL', ''), timeout=3.0, rounds=1, exclude=bad)
+        if w3 is None:
+            return None
+        transport_failed = False
+        for factory_addr, fn_name in FACTORIES:
+            ABI = [{'inputs': [{'name': '_owner', 'type': 'address'}], 'name': fn_name, 'outputs': [{'name': '', 'type': 'address'}], 'stateMutability': 'view', 'type': 'function'}]
             try:
-                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 5}))
                 ct = w3.eth.contract(address=Web3.to_checksum_address(factory_addr), abi=ABI)
-                fn = getattr(ct.functions, fn_name)
-                result = fn(eoa_cs).call()
+                result = getattr(ct.functions, fn_name)(eoa_cs).call()
                 if result and result != '0x' + '0' * 40:
                     return Web3.to_checksum_address(result)
-            except Exception:
+            except Exception as e:
+                if _is_rpc_transport_error(e):
+                    transport_failed = True
+                    break
                 continue
+        if not transport_failed:
+            return None
+        bad.add(rpc)
     return None
 
 class Side(str, Enum):
@@ -2139,9 +2269,23 @@ class BinanceFeed:
         self._running = True
         # aggTrade: same last price as @trade, far fewer messages (less loop pressure).
         streams = '/'.join((f'{c.lower()}usdt@aggTrade' for c in self._coins))
-        url = f'wss://stream.binance.com:9443/stream?streams={streams}'
+        # R10: the lead feed is the whole strategy - one blocked host must not
+        # silence it.  stream.binance.com answers HTTP 451 from several cloud
+        # regions (verified 2026-07-26); data-stream.binance.vision serves the
+        # identical aggTrade stream and is not geo-filtered.  Override the primary
+        # with BINANCE_WS_URL (base, without /stream) when using a private relay.
+        bases = []
+        for base in (_env_str('BINANCE_WS_URL', 'wss://stream.binance.com:9443'), 'wss://data-stream.binance.vision'):
+            base = base.rstrip('/')
+            if base.endswith('/stream'):
+                base = base[:-len('/stream')]
+            if base and base not in bases:
+                bases.append(base)
+        idx = 0
+        fails = 0
         backoff = 1.0
         while self._running:
+            url = f'{bases[idx % len(bases)]}/stream?streams={streams}'
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=5, compression=None) as ws:
                     self._ws = ws
@@ -2185,6 +2329,10 @@ class BinanceFeed:
             except Exception as e:
                 self._ws = None
                 if self._running:
+                    fails += 1
+                    if len(bases) > 1 and fails % 2 == 0:
+                        idx += 1
+                        self.log.warning('Binance host %s failing (%s) - switching to %s', bases[(idx - 1) % len(bases)], str(e)[:120], bases[idx % len(bases)])
                     self.log.warning('WS error: %s (retry in %.0fs)', e, backoff)
                     await asyncio.sleep(backoff * 0.5 + random.uniform(0.0, backoff * 0.5))
                     backoff = min(backoff * 2, 30)
@@ -3596,6 +3744,10 @@ class FiveMinStrategy:
         self._trail_breach_counts: Dict[Any, int] = {}
         self._net_exposure: float = 0.0
         self._gross_exposure: float = 0.0
+        # R15 FIX: market_ids whose inventory has resolved and is awaiting an
+        # authoritative settlement.  Excluded from the entry exposure caps.
+        self._settling_mids: Set[str] = set()
+        self._retained_settle_log: Dict[str, float] = {}
         self._pending_entry: Dict[Tuple[str, str], float] = {}
         self._realized_loss: Dict[str, float] = {}
         self._sustain_counts: Dict[str, int] = {}
@@ -3692,8 +3844,14 @@ class FiveMinStrategy:
         _gross_exposure are otherwise maintained incrementally (Bot._on_fill,
         _settle_resolved_market) and this is their only periodic drift check.
         """
-        self._net_exposure = sum((m.pos_yes.cost - m.pos_no.cost for m in markets))
-        self._gross_exposure = sum((m.pos_yes.cost + m.pos_no.cost for m in markets))
+        # R15 FIX: drop settling mids that no longer hold redemption metadata, then
+        # resync the caps over price-bearing inventory only.
+        if self._settling_mids:
+            live_mids = {k[0] for k in self._redeem_meta}
+            self._settling_mids &= live_mids
+        settling = self._settling_mids
+        self._net_exposure = sum((m.pos_yes.cost - m.pos_no.cost for m in markets if m.market_id not in settling))
+        self._gross_exposure = sum((m.pos_yes.cost + m.pos_no.cost for m in markets if m.market_id not in settling))
 
     async def _evaluate(self, mkt: Market) -> None:
         raise RuntimeError('directional (bidirectional) strategy is retired; _evaluate has no callers')
@@ -3828,14 +3986,27 @@ class FiveMinStrategy:
                     try:
                         _symbol = f'{mkt.coin}USDT'
                         _start_ms = int(interval_start * 1000)
-                        _url = f'https://api.binance.com/api/v3/klines?symbol={_symbol}&interval=1m&startTime={_start_ms}&limit=1'
+                        # R10: api.binance.com answers 451 in several cloud regions;
+                        # data-api.binance.vision serves the same klines. Try both
+                        # (BINANCE_REST_URL overrides the primary).
+                        _hosts = []
+                        for _h in (_env_str('BINANCE_REST_URL', 'https://api.binance.com'), 'https://data-api.binance.vision'):
+                            _h = _h.rstrip('/')
+                            if _h and _h not in _hosts:
+                                _hosts.append(_h)
                         async with aiohttp.ClientSession() as _s:
-                            async with _s.get(_url, timeout=aiohttp.ClientTimeout(total=3)) as _r:
-                                if _r.status == 200:
-                                    _data = await _r.json()
-                                    if _data and len(_data) > 0:
-                                        open_price = float(_data[0][1])
-                                        self.log.info('OPEN-PRICE REST fallback: %s @ %.4f', mkt.coin, open_price)
+                            for _host in _hosts:
+                                _url = f'{_host}/api/v3/klines?symbol={_symbol}&interval=1m&startTime={_start_ms}&limit=1'
+                                try:
+                                    async with _s.get(_url, timeout=aiohttp.ClientTimeout(total=3)) as _r:
+                                        if _r.status == 200:
+                                            _data = await _r.json()
+                                            if _data and len(_data) > 0:
+                                                open_price = float(_data[0][1])
+                                                self.log.info('OPEN-PRICE REST fallback: %s @ %.4f (%s)', mkt.coin, open_price, _host)
+                                                break
+                                except Exception:
+                                    continue
                     except Exception:
                         pass
             if open_price is None:
@@ -4862,6 +5033,42 @@ class FiveMinStrategy:
         for mid in resolved_mids:
             self._settle_resolved_market(mid)
 
+    def _release_settling_exposure(self, market_id: str, leg_keys: List[Tuple[str, str]]) -> None:
+        """R15 FIX: take resolved inventory out of the entry exposure caps.
+
+        A market that has resolved carries no price risk any more - the payout is a
+        fixed claim - and its cash was debited at entry, so the balance already
+        reflects it.  Leaving it in _net_exposure / _gross_exposure froze the entry
+        budget for as long as settlement was unprovable (RPC outage, paper mode with
+        no oracle history) and silently stopped all trading.  Idempotent.
+        """
+        for key in leg_keys:
+            meta = self._redeem_meta.get(key)
+            if isinstance(meta, dict):
+                meta['awaiting_settlement'] = True
+        if market_id in self._settling_mids:
+            return
+        self._settling_mids.add(market_id)
+        mkt = self._market_lookup(market_id) if self._market_lookup is not None else None
+        if mkt is None:
+            return
+        self._net_exposure -= float(mkt.pos_yes.cost) - float(mkt.pos_no.cost)
+        self._gross_exposure -= float(mkt.pos_yes.cost) + float(mkt.pos_no.cost)
+        if abs(self._net_exposure) < 1e-09:
+            self._net_exposure = 0.0
+        self._gross_exposure = max(0.0, self._gross_exposure)
+        self.log.info('SETTLE-PENDING %s | $%.2f of resolved inventory released from the entry caps until settlement confirms', market_id, float(mkt.pos_yes.cost) + float(mkt.pos_no.cost))
+
+    def _log_retained_settlement(self, market_id: str, msg: str, *args: Any) -> None:
+        """R17 FIX: the resolution sweep runs every few seconds; log once per 5 min."""
+        now = time.time()
+        last = self._retained_settle_log.get(market_id, 0.0)
+        if now - last < RETAINED_SETTLE_LOG_S:
+            self.log.debug(msg, *args)
+            return
+        self._retained_settle_log[market_id] = now
+        self.log.warning(msg, *args)
+
     def _settle_resolved_market(self, market_id: str, winning_asset_id: Optional[str]=None) -> None:
         legs = [(k, v) for k, v in list(self._redeem_meta.items()) if k[0] == market_id]
         if not legs:
@@ -4974,8 +5181,13 @@ class FiveMinStrategy:
             if self.om is not None:
                 self.om.clear_entry_strategy(mkt.yes_token)
                 self.om.clear_entry_strategy(mkt.no_token)
-            self._net_exposure -= old_yes_cost - old_no_cost
-            self._gross_exposure -= local_cost
+            # R15 FIX: only debit the caps if this market's exposure was not already
+            # released when it entered the awaiting-settlement state.
+            if market_id not in self._settling_mids:
+                self._net_exposure -= old_yes_cost - old_no_cost
+                self._gross_exposure -= local_cost
+            self._settling_mids.discard(market_id)
+            self._retained_settle_log.pop(market_id, None)
             if abs(self._net_exposure) < 1e-09:
                 self._net_exposure = 0.0
             self._gross_exposure = max(0.0, self._gross_exposure)
@@ -5012,7 +5224,26 @@ class FiveMinStrategy:
 
         if self.cfg.dry_run:
             if official is None:
-                self.log.info('RESOLVED %s | dry-run lacks winner evidence; settlement retained', coin)
+                # R16 FIX: paper mode has no second source of truth.  When the oracle
+                # history cannot cover the interval close (typically: the bot booted
+                # after it closed), the position would be retained forever.  After the
+                # grace window, close it flat at cost - realized 0, never an invented
+                # win - so paper inventory and capital recycle.  Live never estimates.
+                _end_ts = 0.0
+                _mkt_end = self._market_lookup(market_id) if self._market_lookup is not None else None
+                if _mkt_end is not None and getattr(_mkt_end, 'end_time', None):
+                    _end_ts = float(_mkt_end.end_time or 0.0)
+                if _end_ts <= 0.0:
+                    try:
+                        _end_ts = float(meta0.get('end_time') or 0.0)
+                    except (TypeError, ValueError):
+                        _end_ts = 0.0
+                if _end_ts > 0.0 and time.time() - _end_ts >= DRY_STALE_SETTLE_S:
+                    self.log.warning('RESOLVED %s | dry-run: no winner evidence %.0fs after close; closing paper position FLAT at cost $%.4f (no PnL booked)', coin, time.time() - _end_ts, saved_cost_total)
+                    _apply_settlement(float(saved_cost_total), [shares_yes, shares_no], 'dry-no-evidence-flat')
+                    return
+                self._release_settling_exposure(market_id, leg_keys)
+                self._log_retained_settlement(market_id, 'RESOLVED %s | dry-run lacks winner evidence; settlement retained (exposure released)', coin)
                 self._notify_state()
                 return
             _, _, up_won = official
@@ -5023,7 +5254,8 @@ class FiveMinStrategy:
         if not redeem_on:
             # Never book a live official estimate while retaining redeem metadata;
             # that old behavior could book again after redemption was re-enabled.
-            self.log.warning('RESOLVED %s | live redemption disabled; no PnL booked and CTF metadata retained', coin)
+            self._release_settling_exposure(market_id, leg_keys)
+            self._log_retained_settlement(market_id, 'RESOLVED %s | live redemption disabled; no PnL booked and CTF metadata retained (exposure released)', coin)
             self._notify_state()
             return
 
@@ -5032,6 +5264,9 @@ class FiveMinStrategy:
                 raise RuntimeStateError(f'settlement {settlement_id} missing authoritative receipt values')
             _apply_settlement(float(proceeds), [float(x) for x in amounts], 'adapter-event')
 
+        # R15 FIX: the claim is fixed from here on; free the risk budget so an RPC
+        # outage that stalls redemption cannot silently stop the bot from trading.
+        self._release_settling_exposure(market_id, leg_keys)
         enqueued = self.redeemer.enqueue(cond_id, neg_risk, shares_yes, shares_no, _on_settled)
         if not enqueued:
             self.log.debug('Redeem already queued/done for %s (%s)', cond_id[:18], redemption_kind)
@@ -5241,7 +5476,7 @@ def _validate_runtime_state(state: dict, expected_identity: Optional[dict]=None)
     risk = state.get('risk', {})
     if not isinstance(risk, dict):
         raise RuntimeStateError('risk must be an object')
-    for key in ('pnl', 'pnl_peak', 'day_start', 'day_age_s', 'month_start', 'month_age_s'):
+    for key in ('pnl', 'pnl_peak', 'day_start', 'day_start_bankroll', 'day_age_s', 'month_start', 'month_age_s'):
         try:
             value = float(risk.get(key, 0.0))
         except (TypeError, ValueError) as e:
@@ -5382,11 +5617,22 @@ def _snapshot_runtime_state(markets: List['Market'], strategy: Optional['FiveMin
                 market_rows[str(mkt.market_id)] = _market_runtime_row(mkt)
         risk_row: dict = {}
         if risk is not None:
-            risk_row = {'pnl': float(risk._pnl), 'pnl_peak': float(risk._pnl_peak), 'day_start': float(risk._day_start), 'day_age_s': max(0.0, time.monotonic() - risk._day_reset), 'month_start': float(risk._month_start), 'month_age_s': max(0.0, time.monotonic() - risk._month_reset), 'consecutive_losses': int(risk._consecutive_losses), 'halted': bool(risk._halted), 'halt_type': str(risk._halt_type), 'reason': str(risk._reason)}
+            risk_row = {'pnl': float(risk._pnl), 'pnl_peak': float(risk._pnl_peak), 'day_start': float(risk._day_start), 'day_start_bankroll': float(getattr(risk, '_day_start_bankroll', 0.0)), 'day_age_s': max(0.0, time.monotonic() - risk._day_reset), 'month_start': float(risk._month_start), 'month_age_s': max(0.0, time.monotonic() - risk._month_reset), 'consecutive_losses': int(risk._consecutive_losses), 'halted': bool(risk._halted), 'halt_type': str(risk._halt_type), 'reason': str(risk._reason)}
         redemption_rows: List[dict] = []
         done_rows: List[List[str]] = []
         if redeemer is not None:
+            live_keys = set(redeemer._items.keys())
             for item in list(redeemer._items.values()):
+                redemption_rows.append({k: item[k] for k in redeemer._PERSIST_FIELDS if k in item})
+            # R10 FIX: a receipt restored from disk only moves into _items once its
+            # condition is re-queued, so an UNRESOLVED receipt used to be dropped by
+            # the very next snapshot.  Before the degraded-boot fix that was masked
+            # (boot crashed instead of saving); now the bot keeps running through an
+            # RPC outage, so dropping it would lose the receipt and silently release
+            # the token quarantine on the next restart.  Carry unresumed rows over.
+            for key, item in list(redeemer._resume_items.items()):
+                if key in live_keys or key in redeemer._done:
+                    continue
                 redemption_rows.append({k: item[k] for k in redeemer._PERSIST_FIELDS if k in item})
             done_rows = [[str(cid), str(kind)] for cid, kind in sorted(redeemer._done)]
         partial_rows = [{'market_id': str(mid), 'token_id': str(token), 'pnl': float(pnl)} for (mid, token), pnl in sorted((trade_pnl_in_flight or {}).items())]
@@ -5462,6 +5708,8 @@ def _restore_runtime_state(markets: List['Market'], strategy: 'FiveMinStrategy',
         strategy._pending_redemptions[key] = (shares, cost / shares if shares > 1e-09 else 0.0, 1.0)
         if clean.get('open_price'):
             strategy._open_prices[mid] = float(clean['open_price'])
+        if clean.get('awaiting_settlement'):
+            strategy._settling_mids.add(mid)
         restored_mids.add(mid)
     strategy._settlement_ledger = {str(k): dict(v) for k, v in state.get('settlement_ledger', {}).items() if isinstance(v, dict)}
     strategy._net_exposure = 0.0
@@ -5469,6 +5717,10 @@ def _restore_runtime_state(markets: List['Market'], strategy: 'FiveMinStrategy',
     for mkt in markets:
         if mkt.pos_yes.shares > 1e-09 or mkt.pos_no.shares > 1e-09:
             strategy._traded.add(mkt.market_id)
+        # R15 FIX: inventory already flagged as awaiting settlement stays out of
+        # the caps across restarts, otherwise a restart re-freezes the budget.
+        if mkt.market_id in strategy._settling_mids:
+            continue
         strategy._net_exposure += mkt.pos_yes.cost - mkt.pos_no.cost
         strategy._gross_exposure += mkt.pos_yes.cost + mkt.pos_no.cost
     saved_at = float(state.get('saved_at', time.time()))
@@ -5480,6 +5732,9 @@ def _restore_runtime_state(markets: List['Market'], strategy: 'FiveMinStrategy',
         day_age = max(0.0, float(rr.get('day_age_s', 0.0)) + downtime)
         month_age = max(0.0, float(rr.get('month_age_s', 0.0)) + downtime)
         risk._day_start = risk._pnl if day_age >= 86400.0 else float(rr.get('day_start', risk._pnl))
+        # R10 FIX: carry the day's bankroll anchor across restarts so the daily
+        # loss budget is not silently re-based (and shrunk) by a mid-day restart.
+        risk._day_start_bankroll = 0.0 if day_age >= 86400.0 else float(rr.get('day_start_bankroll', 0.0) or 0.0)
         risk._day_reset = time.monotonic() if day_age >= 86400.0 else time.monotonic() - day_age
         risk._month_start = risk._pnl if month_age >= 30 * 86400.0 else float(rr.get('month_start', risk._pnl))
         risk._month_reset = time.monotonic() if month_age >= 30 * 86400.0 else time.monotonic() - month_age
@@ -5623,6 +5878,8 @@ class LatencyArb:
         # R7: tokens the wallet already holds outside this bot's book (set by
         # Bot._boot from the position-recovery barrier). Never entered.
         self._external_tokens: Set[str] = set()
+        # R10: tokens with an unread redemption receipt (Polygon RPC outage).
+        self._deferred_redeem_tokens: Set[str] = set()
         self._shadow_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='latarb-shadow-io')
         self._measure_only = False
         self._measure_only_until: float = 0.0
@@ -5977,6 +6234,8 @@ class LatencyArb:
         # inventory this bot's state does not own - it excludes those tokens instead.
         if token in self._external_tokens:
             return self._skip_latarb('external_inventory', 'token %s already held outside this bot\'s book', token[:16])
+        if token in self._deferred_redeem_tokens:
+            return self._skip_latarb('redeem_unreconciled', 'token %s has an unread redemption receipt (Polygon RPC outage)', token[:16])
         if self.polyfeed and time.monotonic() < self.polyfeed._last_large_trade_ts.get(token, 0.0) + self.cfg.whale_cooldown_s:
             return self._skip_latarb('whale_cooldown')
         if self.cfg.adverse_select_gate:
@@ -6394,6 +6653,7 @@ class RedemptionEngine:
         self.cfg = cfg
         self.log = get_logger('Redeem', cfg.log_level)
         self._w3: Optional[Web3] = None
+        self._rpc_url: str = ''
         self._acct = None
         self._done: Set[Tuple[str, str]] = set()
         self._queued: Set[Tuple[str, str]] = set()
@@ -6426,19 +6686,29 @@ class RedemptionEngine:
             self.log.error('Redeem: refusing unsupported signature type 1 proxy routing')
             return False
         try:
-            rpc = self.cfg.polygon_rpc_url
-            self._w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 15}))
-            if not self._w3.is_connected():
-                self.log.error('Redeem: RPC %s not reachable', rpc)
+            # R10 FIX: failover across the endpoint pool instead of dying on one
+            # dead provider (see _connect_polygon_rpc).
+            w3, rpc, errors = _connect_polygon_rpc(chain_id=self.cfg.chain_id, primary=self.cfg.polygon_rpc_url, timeout=15.0, rounds=2, log=self.log)
+            if w3 is None:
+                self.log.error('Redeem: no Polygon RPC reachable (%d endpoint(s) tried) - %s', len(_polygon_rpc_candidates(self.cfg.polygon_rpc_url)), '; '.join(errors)[:400])
                 return False
+            self._w3 = w3
+            self._rpc_url = rpc
             self._acct = Account.from_key(self.cfg.private_key)
             self._ready = True
             mode = 'Safe-proxy' if self._is_safe() else 'EOA'
-            self.log.info('Redeem engine ready (mode=%s, signer=%s)', mode, self._acct.address)
+            self.log.info('Redeem engine ready (mode=%s, signer=%s, rpc=%s)', mode, self._acct.address, rpc)
             return True
         except Exception as e:
             self.log.error('Redeem init failed: %s', e)
             return False
+
+    def _drop_web3(self) -> None:
+        """Force endpoint re-selection on the next call (provider went bad mid-run)."""
+        if self._ready:
+            self.log.warning('Redeem: dropping RPC %s after transport failure; will re-select', self._rpc_url or '?')
+        self._ready = False
+        self._w3 = None
 
     def preflight(self, require_standard: bool, require_neg_risk: bool) -> Tuple[bool, List[str]]:
         reasons: List[str] = []
@@ -6550,6 +6820,11 @@ class RedemptionEngine:
                 item['attempts'] = int(item.get('attempts', 0)) + 1
                 item['last_error'] = str(e)
                 delay = min(300.0, float(2 ** min(item['attempts'], 8)))
+                # R10 FIX: a transport-level failure means THIS endpoint is bad;
+                # re-select from the pool on the next pass instead of retrying a
+                # dead provider forever with the same Web3 instance.
+                if _is_rpc_transport_error(e):
+                    self._drop_web3()
                 self.log.warning('Redeem retry %d for %s in %.0fs: %s', item['attempts'], item.get('condition_id', '?')[:18], delay, e)
                 self._notify_state()
             finally:
@@ -6674,18 +6949,38 @@ class RedemptionEngine:
         prepared = self._prepare_safe(target, inner) if self._is_safe() else self._prepare_direct(target, inner)
         return {'phase': 'prepared', 'target': target, 'tx_hash': prepared['tx_hash'], 'raw_tx': prepared['raw_tx'], 'nonce': prepared['nonce'], 'prepared_at': time.time(), 'submitted_at': None, 'last_checked_at': None, 'last_error': None, 'terminal_error': None, '_next_delay': 0.0}
 
+    @staticmethod
+    def pending_receipt_rows(state: dict) -> List[dict]:
+        """Persisted redemptions whose on-chain outcome is still unknown.
+        A row without tx_hash was never broadcast; a 'confirmed' row is already
+        reconciled.  Only these rows need an RPC round-trip at boot."""
+        rows = state.get('redemptions', []) if isinstance(state, dict) else []
+        return [r for r in rows if isinstance(r, dict) and r.get('tx_hash') and r.get('phase') != 'confirmed']
+
     def reconcile_saved_receipts(self, state: dict) -> bool:
         """Read-only receipt reconciliation used before the live position barrier."""
-        rows = state.get('redemptions', []) if isinstance(state, dict) else []
-        if not rows:
+        pending = self.pending_receipt_rows(state)
+        # R10 FIX: the old code demanded a live RPC whenever ANY redemption row
+        # existed - including rows already confirmed, which need no network at
+        # all.  That turned a transient provider outage into a permanent boot
+        # crash loop.  No unknown receipt => no RPC needed => boot normally.
+        if not pending:
             return False
         if not self._init_web3():
-            raise RuntimeError('cannot reconcile persisted redemption receipts: Web3 initialization failed')
+            raise RedemptionRPCUnavailable(f'no Polygon RPC endpoint reachable for {len(pending)} unresolved redemption receipt(s)')
         changed = False
-        for row in rows:
-            if not isinstance(row, dict) or not row.get('tx_hash') or row.get('phase') == 'confirmed':
-                continue
-            receipt = self._receipt_or_none(str(row['tx_hash']))
+        for row in pending:
+            try:
+                receipt = self._receipt_or_none(str(row['tx_hash']))
+            except Exception as e:
+                # Endpoint died mid-sweep: rotate once, then report the outage as
+                # retryable rather than as a corrupt-state fault.
+                if not _is_rpc_transport_error(e):
+                    raise
+                self._drop_web3()
+                if not self._init_web3():
+                    raise RedemptionRPCUnavailable(f'Polygon RPC lost while reconciling receipts: {e}') from e
+                receipt = self._receipt_or_none(str(row['tx_hash']))
             if receipt is None:
                 continue
             cond = self._condition_bytes(str(row.get('condition_id') or ''))
@@ -6748,6 +7043,10 @@ class Risk:
         self._pnl = 0.0
         self._pnl_peak = 0.0
         self._day_start = 0.0
+        # R10 FIX: the day's risk budget is anchored to the bankroll at the START
+        # of the day.  See ok() — using the live balance made the cap shrink with
+        # every loss, so the operator's configured allowance was never reachable.
+        self._day_start_bankroll = 0.0
         self._day_reset = time.monotonic()
         self._consecutive_losses = 0
         self._month_start = 0.0
@@ -6758,6 +7057,14 @@ class Risk:
     @property
     def halted(self) -> bool:
         return self._halted
+
+    def _current_bankroll(self) -> float:
+        if self._bankroll_ref is None:
+            return 0.0
+        try:
+            return max(0.0, float(self._bankroll_ref() or 0.0))
+        except Exception:
+            return 0.0
 
     def record_pnl(self, delta: float) -> None:
         self._pnl += delta
@@ -6775,6 +7082,7 @@ class Risk:
             return False
         if time.monotonic() - self._day_reset > 86400:
             self._day_start = self._pnl
+            self._day_start_bankroll = self._current_bankroll()  # R10 FIX: re-anchor the day's budget
             self._day_reset = time.monotonic()
             # R6 FIX: rebase the peak with the day. _pnl_peak used to be an
             # all-time high-water mark while the cap it is compared against is a
@@ -6805,15 +7113,20 @@ class Risk:
         if self._halted:
             return False
         dp = self._pnl - self._day_start
-        bankroll = 0.0
-        if self._bankroll_ref is not None:
-            try:
-                bankroll = max(0.0, float(self._bankroll_ref() or 0.0))
-            except Exception:
-                bankroll = 0.0
+        bankroll = self._current_bankroll()
+        # R10 FIX (2026-07-26): this used the LIVE balance, so the allowance
+        # shrank with every loss and halted the session at loss > B0*p/(1+p)
+        # instead of B0*p — at MAX_DAILY_LOSS_PCT=0.35 that is 26% of bankroll,
+        # not the 35% the operator configured, and on a small account a single
+        # losing clip ended the day.  Anchor the budget to the bankroll observed
+        # at the start of the trading day; fall back to the live value until one
+        # has been observed, and to the hard-dollar cap when neither is known.
+        if self._day_start_bankroll <= 0.0 and bankroll > 0.0:
+            self._day_start_bankroll = bankroll
+        basis = self._day_start_bankroll or bankroll
         # Pct-of-bankroll is primary when known; hard-dollar is fallback when bankroll unknown.
-        if bankroll > 0.0 and self.cfg.max_daily_loss_pct > 0.0:
-            daily_cap = bankroll * self.cfg.max_daily_loss_pct
+        if basis > 0.0 and self.cfg.max_daily_loss_pct > 0.0:
+            daily_cap = basis * self.cfg.max_daily_loss_pct
         else:
             daily_cap = self.cfg.max_daily_loss
         if dp < -daily_cap:
@@ -6883,6 +7196,13 @@ class Bot:
         # does not own (settled dust or inventory from an earlier/other session).
         # Excluded from the ledger, subtracted in the drift check, blocked for entry.
         self._external_positions: Dict[str, float] = {}
+        # R10: tokens of redemption receipts whose on-chain outcome could not be
+        # read at boot (Polygon RPC outage).  Quarantined: entry blocked and
+        # position-barrier mismatches tolerated for exactly these tokens until a
+        # background retry reconciles them.  Everything else trades normally -
+        # an RPC outage must never stop the bot from trading.
+        self._deferred_redeem_tokens: Set[str] = set()
+        self._redeem_reconcile_deferred: bool = False
         self.binance = BinanceFeed(cfg.coins)
         self.chainlink = ChainlinkFeed(cfg.coins)
         self.polyfeed = HyperPolyFeed(shard_count=cfg.ws_shard_count)
@@ -6966,6 +7286,24 @@ class Bot:
             return
         self._loaded_state = _snapshot_runtime_state(self.markets, self.fivemin, self.risk, self.redeemer, self.cfg.dry_run, self._state_identity, self._state_path, self._trade_pnl_in_flight, self.om, self._applied_trade_order, self._applied_ioc_order)
 
+    def _unresolved_redeem_tokens(self) -> Set[str]:
+        """Tokens touched by redemption receipts whose outcome is still unknown."""
+        state = self._loaded_state or {}
+        pending = RedemptionEngine.pending_receipt_rows(state)
+        if not pending:
+            return set()
+        rows_by_cond = {str(row.get('condition_id') or '').lower(): row for row in (state.get('markets', {}) or {}).values() if isinstance(row, dict)}
+        tokens: Set[str] = set()
+        for item in pending:
+            row = rows_by_cond.get(str(item.get('condition_id') or '').lower())
+            if not isinstance(row, dict):
+                continue
+            for key in ('yes_token', 'no_token'):
+                token = str(row.get(key) or '')
+                if token:
+                    tokens.add(token)
+        return tokens
+
     async def _reconcile_saved_redemptions_before_position_barrier(self) -> None:
         if self.cfg.dry_run or not self._loaded_state or not self._loaded_state.get('redemptions'):
             return
@@ -6974,8 +7312,49 @@ class Bot:
             if changed:
                 _save_latarb_state(self._loaded_state, self._state_path, self._state_identity)
                 self.log.warning('Recovered confirmed redemption receipt(s) before live position reconciliation')
+            self._redeem_reconcile_deferred = False
+            self._deferred_redeem_tokens = set()
+        except RedemptionRPCUnavailable as e:
+            # R10 FIX (the 2026-07-26 crash loop): a provider outage is transient
+            # infrastructure, not corrupt state.  Killing the process here made
+            # the bot unrunnable and burned the day in 5s restart cycles.  Boot
+            # instead, quarantine ONLY the tokens whose receipts are unknown, and
+            # retry in the background.  All other markets keep trading.
+            self._redeem_reconcile_deferred = True
+            self._deferred_redeem_tokens = self._unresolved_redeem_tokens()
+            self.log.critical('Polygon RPC unavailable at boot: %s. Continuing WITHOUT redemption reconciliation: %d token(s) quarantined (entry blocked, barrier mismatches tolerated); retrying every %.0fs.', e, len(self._deferred_redeem_tokens), REDEEM_RECONCILE_RETRY_S)
         except Exception as e:
             raise FatalBotError(f'Persisted redemption receipt reconciliation failed: {e}') from e
+
+    async def _redeem_reconcile_retry_loop(self) -> None:
+        """Background retry for a boot-time reconciliation deferred by an RPC outage."""
+        while self._redeem_reconcile_deferred and self.running:
+            await asyncio.sleep(REDEEM_RECONCILE_RETRY_S)
+            if not self._redeem_reconcile_deferred:
+                return
+            try:
+                changed = await asyncio.get_running_loop().run_in_executor(None, self.redeemer.reconcile_saved_receipts, self._loaded_state)
+            except RedemptionRPCUnavailable as e:
+                self.log.warning('Redemption reconciliation still deferred (RPC down): %s', e)
+                continue
+            except Exception as e:
+                # Not an outage: the persisted receipt data itself is wrong.  Halt
+                # trading (same channel the redemption engine uses) rather than
+                # killing a process that may be holding live inventory.
+                self.log.critical('Deferred redemption reconciliation failed on a non-RPC error: %s', e)
+                self.risk._halt(f'redemption reconciliation: {e}', halt_type='redemption')
+                return
+            if changed:
+                _save_latarb_state(self._loaded_state, self._state_path, self._state_identity)
+            self._redeem_reconcile_deferred = False
+            released = len(self._deferred_redeem_tokens)
+            self._deferred_redeem_tokens = set()
+            if self.latency_arb is not None:
+                self.latency_arb._deferred_redeem_tokens = set()
+            self.log.warning('Redemption reconciliation recovered after RPC outage (changed=%s); %d quarantined token(s) released', bool(changed), released)
+            # Re-assert the live barrier now that receipts are authoritative.
+            await self._verify_live_position_state()
+            return
 
     async def _verify_live_position_state(self) -> None:
         if self.cfg.dry_run:
@@ -7100,6 +7479,16 @@ class Bot:
         for token, shares in expected.items():
             if shares >= tolerance and token not in remote:
                 mismatches.append(f'persisted token {token[:16]} shares={shares:.6f} absent remotely')
+        if self._deferred_redeem_tokens:
+            # R10: an unreconciled redemption burns the position on-chain while the
+            # local row still shows it - the exact mismatch above.  While the RPC
+            # outage lasts, these specific tokens are unknowable, so tolerate them
+            # (and block entry on them) instead of refusing to boot.
+            tolerated = [m for m in mismatches if any((t[:16] in m for t in self._deferred_redeem_tokens))]
+            if tolerated:
+                mismatches = [m for m in mismatches if m not in tolerated]
+                for entry in tolerated[:20]:
+                    self.log.critical('POSITION RECOVERY TOLERATED (redemption receipt unread, RPC down): %s', entry)
         self._external_positions = dict(external)
         live_external = {t: s for t, s in external.items() if t not in settled_tokens}
         if settled_tokens:
@@ -7169,6 +7558,16 @@ class Bot:
         else:
             balance = balance_opt
         self.log.info('CLOB balance: $%.4f', balance)
+        if self.cfg.dry_run:
+            # R10 FIX: paper mode against an UNFUNDED wallet (the normal way to
+            # rehearse a build, and the only way to test with throwaway keys)
+            # fetched $0.00, went "SIZING INERT" and never placed a single paper
+            # order - so a dry run could not prove the order path at all.  Only
+            # the simulated bankroll changes; live is untouched.
+            paper_floor = _env_float('DRY_RUN_BANKROLL_USDC', 0.0) or self.cfg.min_order_size / max(self.cfg.max_bankroll_fraction, 1e-09) + max(0.0, float(self.cfg.max_daily_loss))
+            if balance < paper_floor:
+                self.log.warning('DRY_RUN: wallet balance $%.4f is below the paper sizing floor - using simulated bankroll $%.2f (set DRY_RUN_BANKROLL_USDC to override). Live runs always use the real balance.', balance, paper_floor)
+                balance = paper_floor
         if not self.cfg.dry_run and balance <= 0:
             # K7 FIX: hold before the fatal exit (see above).
             self.log.critical('LIVE trading refused: non-positive USDC balance. Holding %.0fs before exit to avoid a supervisor crash loop.', FATAL_PREFLIGHT_HOLD_S)
@@ -7280,6 +7679,8 @@ class Bot:
         self.latency_arb.risk = self.risk
         self.latency_arb.strategy = self.fivemin
         self.latency_arb._external_tokens = set(self._external_positions)
+        # R10: quarantine tokens whose redemption receipt could not be read.
+        self.latency_arb._deferred_redeem_tokens = set(self._deferred_redeem_tokens)
         self.fivemin.redeemer = self.redeemer
         _n_hold, _restored_mids, _state_problems = _restore_runtime_state(self.markets, self.fivemin, self.risk, self.redeemer, self.om, self.cfg.dry_run, self._loaded_state, self._trade_pnl_in_flight, self._applied_trade_order, self._applied_ioc_order)
         self._applied_trade_ids = set(self._applied_trade_order)
@@ -7464,6 +7865,8 @@ class Bot:
         arch = 'EVENT-DRIVEN' if self.cfg.event_driven else 'TIMER'
         self.log.info('Started [%s] [%s]  sig=%d  bal=$%.2f  mkts=%d  shards=%d  json=%s', mode, arch, self.cfg.signature_type, balance, len(self.markets), self.cfg.ws_shard_count, 'orjson' if _FAST_JSON else 'stdlib')
         self.tasks = [asyncio.create_task(self.polyfeed.run(), name='polyfeed'), asyncio.create_task(self.binance.run(), name='binance'), asyncio.create_task(self.chainlink.run(), name='chainlink'), asyncio.create_task(self._reconcile_loop(), name='reconcile'), asyncio.create_task(self._health_loop(), name='health'), asyncio.create_task(self._status_loop(), name='status'), asyncio.create_task(self._fivemin_refresh(), name='discovery'), asyncio.create_task(self.redeemer.run(), name='redeem'), asyncio.create_task(self._shutdown_wait(), name='shutdown')]
+        if self._redeem_reconcile_deferred:
+            self.tasks.append(asyncio.create_task(self._redeem_reconcile_retry_loop(), name='redeem_reconcile_retry'))
         if not self.cfg.dry_run:
             self.tasks.append(asyncio.create_task(self.userfeed.run(), name='userfeed'))
         if not self.cfg.event_driven:
@@ -8069,7 +8472,14 @@ class Bot:
             try:
                 s = self.risk.status()
                 expected_gen = self.fivemin._balance_gen if self.fivemin is not None else None
-                bal = await self.client.get_balance()
+                # R10 FIX: the status loop used to poll the on-chain balance and
+                # apply it as authoritative even in DRY_RUN.  The main loop
+                # deliberately skips that (see the capital-shock note there),
+                # so every 60s the status loop overwrote the paper bankroll with
+                # the real wallet balance -> "CAPITAL SHOCK: free cash $494.91
+                # -> $0.00", resting buys cancelled, sizing inert for the rest
+                # of the paper run.  Paper accounting now stays paper.
+                bal = None if self.cfg.dry_run else await self.client.get_balance()
                 if self.fivemin is not None and bal is not None:
                     await self._apply_balance_snapshot(bal, expected_gen=expected_gen)
                 bal_disp = self.fivemin._balance_cache if self.fivemin is not None else bal if bal is not None else float('nan')
