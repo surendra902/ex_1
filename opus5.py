@@ -101,7 +101,7 @@ except ImportError:
     _json_loads = json.loads
     _json_dumps = json.dumps
     _FAST_JSON = False
-_BOT_VERSION = 'v19.5.9e-oracle-latarb-recovery'
+_BOT_VERSION = 'v19.5.9f-latarb-anchor-fix'
 VENUE_MIN_ORDER_USDC: float = 2.0
 # R27: Polymarket re-ticks a market (0.01 -> 0.001) once its price runs past
 # these bands. Observed live 2026-07-27 on btc/eth/sol-updown-15m at ~0.99.
@@ -136,6 +136,15 @@ LATARB_DEFAULT_TAKER_DELAY_S: float = 0.25
 # signal this strategy trades, not a reason to skip.  See the veto site for the
 # measurement that set this value.
 LATARB_ORACLE_VETO_LEAD_FRAC: float = 0.5
+# R33 FIX: a FAK that matched only dust is not a fill. In the operator's
+# 2026-07-27 run two attempts were both booked as fills (rate=100%) while the
+# notional fill ratio was 1e-06, i.e. the venue matched a rounding crumb. That
+# published a bogus 100% fill rate to the live-proof sizing gate, permanently
+# marked the market as traded, fed a worthless position into the redemption
+# engine, and injected a +367bps adverse-selection sample that alone exceeded
+# the 40bps MAX_ADVERSE_BPS gate. Use the same dust scale the drift check uses
+# (DRIFT_HALT_THRESHOLD_SHARES default 0.01) as the floor for "this was a fill".
+LATARB_MIN_FILL_SHARES: float = 0.01
 # R16 FIX: paper mode only.  A resolved market whose winner cannot be proven
 # from oracle history (the bot booted after the interval closed) is flat-closed
 # at cost once it is this stale, so paper inventory and capital recycle instead
@@ -4255,6 +4264,68 @@ class FiveMinStrategy:
         self._net_exposure = sum((m.pos_yes.cost - m.pos_no.cost for m in markets if m.market_id not in settling))
         self._gross_exposure = sum((m.pos_yes.cost + m.pos_no.cost for m in markets if m.market_id not in settling))
 
+    async def resolve_open_price(self, mkt: 'Market', interval_start: float, now: float) -> Optional[float]:
+        """R32: single source of truth for a market's interval open anchor.
+        Chainlink 1Hz history first, then the Binance 1m-kline REST fallback
+        (throttled per coin). Result is cached in _open_prices so every strategy
+        path - directional AND LatArb - resolves the anchor exactly one way.
+        Returns None when no anchor could be established."""
+        cached = self._open_prices.get(mkt.market_id)
+        if cached and cached > 0:
+            return float(cached)
+        open_price = self.tracker.get_price_at_or_before(str(mkt.coin), interval_start, max_lag_s=10.0)
+        if open_price is None:
+            _c = mkt.coin or '?'
+            _now_rest = time.monotonic()
+            if _now_rest - self._rest_open_last.get(_c, 0.0) >= 3.0:
+                self._rest_open_last[_c] = _now_rest
+                try:
+                    _symbol = f'{mkt.coin}USDT'
+                    _start_ms = int(interval_start * 1000)
+                    # R10: api.binance.com answers 451 in several cloud regions;
+                    # data-api.binance.vision serves the same klines. Try both
+                    # (BINANCE_REST_URL overrides the primary).
+                    _hosts = []
+                    for _h in (_env_str('BINANCE_REST_URL', 'https://api.binance.com'), 'https://data-api.binance.vision'):
+                        _h = _h.rstrip('/')
+                        if _h and _h not in _hosts:
+                            _hosts.append(_h)
+                    async with aiohttp.ClientSession() as _s:
+                        for _host in _hosts:
+                            _url = f'{_host}/api/v3/klines?symbol={_symbol}&interval=1m&startTime={_start_ms}&limit=1'
+                            try:
+                                async with _s.get(_url, timeout=aiohttp.ClientTimeout(total=3)) as _r:
+                                    if _r.status == 200:
+                                        _data = await _r.json()
+                                        if _data and len(_data) > 0:
+                                            open_price = float(_data[0][1])
+                                            self.log.info('OPEN-PRICE REST fallback: %s @ %.4f (%s)', mkt.coin, open_price, _host)
+                                            break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+        if open_price is None:
+            c = mkt.coin or '?'
+            n = self._no_open_price_counts.get(c, 0) + 1
+            self._no_open_price_counts[c] = n
+            if n == 20 and c not in self._open_price_warned:
+                self._open_price_warned.add(c)
+                self.log.critical('OPEN-PRICE FAILURE: %s has had no interval anchor for %d consecutive evals (interval_start=%.0f, now=%.0f). No %s trades can fire until the price feed / clock is fixed.  Check Binance connectivity and discovery timing.', c, n, interval_start, now, c)
+            elif n == 3 and c not in self._open_price_warned:
+                self.log.warning('no_open_price %s: %d consecutive misses (hist may be cold or feed lagging). interval_start=%.0f', c, n, interval_start)
+            else:
+                self.log.debug('no_open_price %s: miss #%d (interval_start=%.0f)', c, n, interval_start)
+            return None
+        c = mkt.coin or '?'
+        if c in self._no_open_price_counts:
+            self._no_open_price_counts.pop(c, None)
+        if c in self._open_price_warned:
+            self._open_price_warned.discard(c)
+            self.log.info('OPEN-PRICE OK: %s anchor recovered', c)
+        self._open_prices[mkt.market_id] = open_price
+        return float(open_price)
+
     async def _evaluate(self, mkt: Market) -> None:
         raise RuntimeError('directional (bidirectional) strategy is retired; _evaluate has no callers')
 
@@ -4379,57 +4450,8 @@ class FiveMinStrategy:
             if current_price <= 0:
                 return
         if mkt.market_id not in self._open_prices:
-            open_price = self.tracker.get_price_at_or_before(str(mkt.coin), interval_start, max_lag_s=10.0)
-            if open_price is None:
-                _c = mkt.coin or '?'
-                _now_rest = time.monotonic()
-                if _now_rest - self._rest_open_last.get(_c, 0.0) >= 3.0:
-                    self._rest_open_last[_c] = _now_rest
-                    try:
-                        _symbol = f'{mkt.coin}USDT'
-                        _start_ms = int(interval_start * 1000)
-                        # R10: api.binance.com answers 451 in several cloud regions;
-                        # data-api.binance.vision serves the same klines. Try both
-                        # (BINANCE_REST_URL overrides the primary).
-                        _hosts = []
-                        for _h in (_env_str('BINANCE_REST_URL', 'https://api.binance.com'), 'https://data-api.binance.vision'):
-                            _h = _h.rstrip('/')
-                            if _h and _h not in _hosts:
-                                _hosts.append(_h)
-                        async with aiohttp.ClientSession() as _s:
-                            for _host in _hosts:
-                                _url = f'{_host}/api/v3/klines?symbol={_symbol}&interval=1m&startTime={_start_ms}&limit=1'
-                                try:
-                                    async with _s.get(_url, timeout=aiohttp.ClientTimeout(total=3)) as _r:
-                                        if _r.status == 200:
-                                            _data = await _r.json()
-                                            if _data and len(_data) > 0:
-                                                open_price = float(_data[0][1])
-                                                self.log.info('OPEN-PRICE REST fallback: %s @ %.4f (%s)', mkt.coin, open_price, _host)
-                                                break
-                                except Exception:
-                                    continue
-                    except Exception:
-                        pass
-            if open_price is None:
-                c = mkt.coin or '?'
-                n = self._no_open_price_counts.get(c, 0) + 1
-                self._no_open_price_counts[c] = n
-                if n == 20 and c not in self._open_price_warned:
-                    self._open_price_warned.add(c)
-                    self.log.critical('OPEN-PRICE FAILURE: %s has had no interval anchor for %d consecutive evals (interval_start=%.0f, now=%.0f). No %s trades can fire until the price feed / clock is fixed.  Check Binance connectivity and discovery timing.', c, n, interval_start, now, c)
-                elif n == 3 and c not in self._open_price_warned:
-                    self.log.warning('no_open_price %s: %d consecutive misses (hist may be cold or feed lagging). interval_start=%.0f', c, n, interval_start)
-                else:
-                    self.log.debug('no_open_price %s: miss #%d (interval_start=%.0f)', c, n, interval_start)
+            if await self.resolve_open_price(mkt, interval_start, now) is None:
                 return
-            c = mkt.coin or '?'
-            if c in self._no_open_price_counts:
-                self._no_open_price_counts.pop(c, None)
-            if c in self._open_price_warned:
-                self._open_price_warned.discard(c)
-                self.log.info('OPEN-PRICE OK: %s anchor recovered', c)
-            self._open_prices[mkt.market_id] = open_price
         open_price = self._open_prices[mkt.market_id]
         tau_s = max(1.0, ttc)
         if not mkt.fresh_books(self.cfg.book_max_age_ms):
@@ -5054,7 +5076,10 @@ class FiveMinStrategy:
 
     def register_latarb_fill_for_settle(self, mkt: 'Market', token_id: str, shares: float, fill_px: float, fee: float=0.0) -> None:
         """P0: register settlement/redeem meta on every confirmed LatArb fill (not only near expiry)."""
-        if shares < 1e-09 or fill_px <= 0:
+        # R33: dust below the drift/fill floor is worth far less than the gas to
+        # redeem it, and feeding it into the redemption engine is exactly what
+        # produced the 2026-07-27 nonce_conflict halt. Do not register it.
+        if shares < LATARB_MIN_FILL_SHARES or fill_px <= 0:
             return
         rkey = (mkt.market_id, token_id)
         cost_add = float(fill_px) * float(shares) + max(0.0, float(fee))
@@ -6334,9 +6359,33 @@ class LatencyArb:
         self._place_lock = asyncio.Lock()
         self._skip_log_last: Dict[str, float] = {}
         self._skip_counts = Counter()
+        # R32: markets whose interval anchor is being resolved off the hot path.
+        self._open_price_warming: Set[str] = set()
+        self._open_price_tasks: Set[asyncio.Task] = set()
 
     def _note_latarb_skip(self, key: str) -> None:
         self._skip_counts[str(key)] += 1
+
+    def _warm_open_price(self, mkt: 'Market', interval_start: float, now: float) -> None:
+        """R32: resolve a missing interval anchor off the hot path (one task per market)."""
+        strat = self.strategy
+        if strat is None or mkt.market_id in self._open_price_warming:
+            return
+        self._open_price_warming.add(mkt.market_id)
+
+        async def _warm() -> None:
+            try:
+                await strat.resolve_open_price(mkt, interval_start, now)
+            except Exception as e:
+                self.log.debug('open-price warm failed %s: %s', mkt.market_id, e)
+            finally:
+                self._open_price_warming.discard(mkt.market_id)
+        try:
+            t = asyncio.create_task(_warm(), name=f'openpx_{mkt.market_id[:8]}')
+            self._open_price_tasks.add(t)
+            t.add_done_callback(self._open_price_tasks.discard)
+        except RuntimeError:
+            self._open_price_warming.discard(mkt.market_id)
 
     def _skip_latarb(self, key: str, msg: str='', *args: Any) -> None:
         if msg:
@@ -6556,7 +6605,24 @@ class LatencyArb:
         # Open from settlement-oracle history (Chainlink). Lead price = Binance for displacement.
         open_price = self.tracker.get_price_at_or_before(coin, interval_start, max_lag_s=10.0)
         if not open_price or open_price <= 0:
-            return self._skip_latarb('missing_open_price')
+            # R32 FIX (the reason this bot took no trades): Chainlink history only
+            # starts at process boot, so every market whose interval began before
+            # boot had no anchor and was skipped forever. missing_open_price was
+            # the #1 skip bucket in the operator's 2026-07-27 live run (1,236) and
+            # 100% of skips in a clean 2.5-minute replay (1,964 of 1,964, zero
+            # attempts). Combined with a supervisor that restarts every 5s, the
+            # bot was permanently blind. The directional path already solves this
+            # with a Binance 1m-kline REST fallback; use that same resolved anchor
+            # here instead of a second, divergent implementation. The resolver is
+            # never awaited in this hot path (it can do a 3s HTTP round-trip):
+            # warm it in the background and skip this tick only.
+            strat_anchor = self.strategy
+            cached = float(strat_anchor._open_prices.get(mkt.market_id) or 0.0) if strat_anchor is not None else 0.0
+            if cached > 0:
+                open_price = cached
+            else:
+                self._warm_open_price(mkt, interval_start, now)
+                return self._skip_latarb('missing_open_price')
         # Persist open price for settle meta (LatArb owns this now).
         strat_op = self.strategy
         if strat_op is not None and mkt.market_id not in strat_op._open_prices:
@@ -6807,6 +6873,11 @@ class LatencyArb:
         # slippage measurable at all; the miss path clears it again below.
         if token:
             self._expected_fill_px[token] = float(entry_vwap2)
+        # R33: the durable booking path (_on_fill) is the only authority on how
+        # much actually filled; the tracked-order snapshot can still read 0 when
+        # the fill arrived over WS/REST during place(). Measure the position delta.
+        _pos_leg = mkt.pos_yes if up else mkt.pos_no
+        _shares_before = float(getattr(_pos_leg, 'shares', 0.0) or 0.0)
         try:
             oid = await self.om.place(token, Side.BUY, sweep, sz, Strategy.TEMPORAL, otype='FAK', neg_risk=mkt.neg_risk, tick_size=tick, quote_ts=book.ts if book else None, max_quote_age_ms=self.cfg.latarb_shadow_max_age_ms if self.cfg.latarb_shadow_max_age_ms > 0.0 else None)
         except (Exception, asyncio.CancelledError):
@@ -6837,7 +6908,13 @@ class LatencyArb:
             if tracked is not None:
                 matched_sz = float(tracked.filled_size or 0.0)
                 actual_fill_px = float(getattr(tracked, 'avg_fill_price', 0.0) or 0.0)
-        filled = matched_sz > 1e-12
+        # R33: prefer whatever the durable fill path actually booked.
+        _booked_sz = max(0.0, float(getattr(_pos_leg, 'shares', 0.0) or 0.0) - _shares_before)
+        if _booked_sz > matched_sz:
+            matched_sz = _booked_sz
+            if actual_fill_px <= 0.0:
+                actual_fill_px = float(getattr(_pos_leg, 'avg_price', 0.0) or 0.0)
+        filled = matched_sz > LATARB_MIN_FILL_SHARES
         req_shares = sz / max(float(sweep), 0.001)
         fill_frac = _latarb_fill_fraction(matched_sz, req_shares)
         self._record_fok_attempt(filled=filled, sweep=sweep, edge=edge, coin=coin, market_id=mkt.market_id, token=token, model_prob=model_prob, expected_vwap=float(entry_vwap2), matched_size=matched_sz, fill_fraction=fill_frac, actual_fill_px=actual_fill_px)
@@ -8248,12 +8325,45 @@ class Bot:
                     raise
             else:
                 self.log.critical('capital_shock revalidation: free=$%.2f gross=$%.2f gross_cap=$%.2f sizeable=%s within_cap=%s - halt stands.', _free, _gross, _gross_cap, _sizeable, _within_cap)
+        # R31 FIX (the live blocker, 2026-07-27 log): a restored 'redemption' halt
+        # was treated as an unrecoverable data-integrity stop, but the condition
+        # that raises it is explicitly transient. That day's incident: redemption
+        # nonce 46 was consumed while the receipt was not yet visible to the RPC
+        # node, so _advance_redeem returned phase='nonce_conflict' and halted at
+        # 16:17:46. The NEXT boot's receipt sweep resolved it - the log shows
+        # 'REDEEM CONFIRMED 0xb2450366aa7bcc4e ... payout=$0.000000' followed by
+        # 'Recovered confirmed redemption receipt(s) before live position
+        # reconciliation' at 16:18:19 - yet the halt gate still refused, because
+        # 'redemption' was not in the revalidation set. Result: 3,326 supervisor
+        # restarts over 12h37m and zero trading on a fully healthy account.
+        # Revalidate the halt's OWN predicate: the boot sweep at
+        # _reconcile_saved_redemptions_before_position_barrier() has already
+        # re-read every persisted redemption receipt from chain. If no redemption
+        # row is unresolved any more, the ambiguity that raised the halt is gone
+        # and the halt is stale. Clear only then - an unresolved row (including
+        # nonce_conflict / stuck / receipt_error, which all keep tx_hash with
+        # phase != 'confirmed') still blocks startup, and so does an RPC outage
+        # that prevented the sweep from being authoritative at all.
+        if self.risk.halted and self.risk.status()['halt_type'] == 'redemption' and (not self.cfg.dry_run):
+            _pending = RedemptionEngine.pending_receipt_rows(self._loaded_state or {})
+            if self._redeem_reconcile_deferred:
+                self.log.critical('redemption revalidation: Polygon RPC was unavailable at boot, receipts are not authoritative - halt stands.')
+            elif _pending:
+                self.log.critical('redemption revalidation: %d redemption receipt(s) still unresolved after the boot sweep - halt stands. first=%s phase=%s err=%s', len(_pending), str(_pending[0].get('tx_hash') or '')[:18], _pending[0].get('phase'), _pending[0].get('terminal_error'))
+            else:
+                self.log.warning('Restored redemption halt CLEARED: the boot receipt sweep resolved every persisted redemption (0 unresolved rows).')
+                self.risk._halted, self.risk._halt_type, self.risk._reason = (False, '', '')
+                try:
+                    self._save_runtime_state()
+                except Exception as _e:
+                    self.log.critical('could not persist cleared redemption halt: %s', _e)
+                    raise
         if self.risk.halted:
             _st = self.risk.status()
             self.log.critical('REFUSING TO START: risk state restored as HALTED [%s]: %s', _st['halt_type'], _st['reason'])
             self.log.critical('  pnl=$%.2f day=$%.2f consec_losses=%d  state=%s', _st['pnl'], _st['daily'], _st['consec_losses'], self._state_path)
             self.log.critical('  daily_loss / consec_losses / drawdown halts clear themselves at the next daily reset.')
-            self.log.critical('  drift / rpc / capital_shock halts are revalidated on every boot and clear themselves once the fresh check agrees.')
+            self.log.critical('  drift / rpc / capital_shock / redemption halts are revalidated on every boot and clear themselves once the fresh check agrees.')
             self.log.critical('  Any other halt type is a data-integrity stop: fix the cause, then delete the state file to re-arm.')
             boot_record(f'EXIT rc={EXIT_HALTED} REFUSING TO START', f"halt_type={_st['halt_type']} reason={_st['reason']}")
             raise SystemExit(EXIT_HALTED)
@@ -8812,7 +8922,11 @@ class Bot:
                 self.om.latch_fill_failure(f'fill apply checkpoint failed for {trade_id or tid}: {e}')
                 raise
             probe_sz = shares if side == Side.BUY else sell_fill
-            if probe_sz > 0 and self.om is not None:
+            # R33: a dust match carries no adverse-selection information, but it
+            # still writes a full sample into the EWMA the entry gate reads. One
+            # such sample (+367bps, clamped to the +120bps ceiling) was enough to
+            # sit above MAX_ADVERSE_BPS=40 and throttle every later entry.
+            if probe_sz > LATARB_MIN_FILL_SHARES and self.om is not None:
                 try:
                     self.om.spawn_fill_probe(tid, side, price, probe_sz, trade_id='')
                 except Exception:
