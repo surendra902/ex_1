@@ -32,7 +32,7 @@ else:
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Deque, Dict, List, Optional, Set, Tuple
@@ -103,6 +103,15 @@ except ImportError:
     _FAST_JSON = False
 _BOT_VERSION = 'v19.5.9e-oracle-latarb-recovery'
 VENUE_MIN_ORDER_USDC: float = 2.0
+# R27: Polymarket re-ticks a market (0.01 -> 0.001) once its price runs past
+# these bands. Observed live 2026-07-27 on btc/eth/sol-updown-15m at ~0.99.
+_TICK_EXTREME_HI: float = 0.96
+_TICK_EXTREME_LO: float = 0.04
+_TICK_REFRESH_COOLDOWN_S: float = 20.0
+# R28: at most one drift-triggered REST re-snapshot per token per window, and
+# how many consecutive disagreeing frames count as evidence of a real gap.
+_BOOK_RESYNC_COOLDOWN_S: float = 10.0
+_BOOK_DRIFT_STRIKES: int = 4
 GBM_SIGMA_FLOOR_PER_SEC: float = 0.00025
 # Live LatArb + shadow reject when BOTH books are older than this (local age).
 # Offline analyze/go-no-go must use the same constant (parity).
@@ -326,6 +335,7 @@ class Config:
     redeem_enabled: bool = False
     polygon_rpc_url: str = 'https://polygon-rpc.com'
     redeem_max_gas_gwei: float = 300.0
+    redeem_min_priority_gwei: float = 30.0
     latarb_shadow: bool = True
     latarb_shadow_path: str = '~/latarb_shadow.csv'
     # Transport-age floor; 0 measures liquid books without imposing artificial staleness.
@@ -362,6 +372,11 @@ class Config:
     shadow_probe_enabled: bool = True
     adverse_select_gate: bool = True
     adverse_ewma_alpha: float = 0.1
+    adverse_ewma_halflife_s: float = 300.0
+    # R29: winsorise a single adverse observation at this many bps (0 = off).
+    adverse_ewma_clamp_bps: float = 120.0
+    # R28: full REST re-snapshot cadence per token (0 = drift-triggered only).
+    book_resync_s: float = 120.0
     entry_mode: str = 'maker'
     maker_join_ticks: int = 0
     fast_exit_drop_pct: float = 0.06
@@ -451,7 +466,7 @@ class Config:
         if raw_proxy and (not raw_proxy.startswith('0x')):
             raw_proxy = '0x' + raw_proxy
         proxy = Web3.to_checksum_address(raw_proxy.lower()) if raw_proxy else ''
-        return cls(private_key=pk, proxy_address=proxy, signature_type=gi('POLYMARKET_SIGNATURE_TYPE', 2), clob_url=g('CLOB_URL', g('CLOB_API_URL', 'https://clob.polymarket.com')).rstrip('/ '), gamma_url=g('GAMMA_URL', g('GAMMA_API_URL', 'https://gamma-api.polymarket.com')).rstrip('/ '), chain_id=gi('CHAIN_ID', 137), coins=[c.strip().upper() for c in g('COINS', g('BINANCE_COINS', 'BTC,ETH,SOL')).split(',') if c.strip()], min_order_size=gf('MIN_ORDER_USDC', 2.0), max_order_size=gf('MAX_ORDER_USDC', 25.0), max_position=gf('MAX_POSITION_USDC', 100.0), max_bankroll_fraction=gf('MAX_BANKROLL_FRACTION', 0.1), max_daily_loss=gf('MAX_DAILY_LOSS', 50.0), max_open_orders=gi('MAX_OPEN_ORDERS', 15), rate_limit=gi('ORDER_RATE_LIMIT_PER_SEC', gi('ORDER_RATE_LIMIT', 12)), book_max_age_ms=gf('MAX_BOOK_AGE_MS', 500.0), max_net_exposure_usdc=gf('MAX_NET_EXPOSURE_USDC', 200.0), dry_run=gb('DRY_RUN', True), log_level=g('LOG_LEVEL', 'INFO'), min_edge=gf('MIN_EDGE', 0.012), entry_start_s=gi('ENTRY_START_S', 15), entry_end_s=gi('ENTRY_END_S', 260), strategy_interval_s=gf('STRATEGY_INTERVAL_S', 1.5), kelly_fraction=gf('KELLY_FRACTION', 0.18), sustain_ticks=gi('SUSTAIN_TICKS', 1), stop_loss_prob=gf('STOP_LOSS_PROB', 0.43), forced_exit_ttc_s=gi('FORCED_EXIT_TTC_S', 25), latency_arb_enabled=gb('LATENCY_ARB_ENABLED', False), latency_arb_edge=gf('LATENCY_ARB_EDGE', 0.02), latency_arb_cooldown=gf('LATENCY_ARB_COOLDOWN_S', 2.0), latency_arb_min_prob=gf('LATENCY_ARB_MIN_PROB', 0.58), latarb_min_proven_signals=gi('LATARB_MIN_PROVEN_SIGNALS', 200), latarb_min_win_rate=gf('LATARB_MIN_WIN_RATE', 0.52), latarb_min_total_pnl=gf('LATARB_MIN_TOTAL_PNL', 0.0), require_latarb_live_proof=gb('REQUIRE_LATARB_LIVE_PROOF', False), latarb_bootstrap_live=gb('LATARB_BOOTSTRAP_LIVE', True), latarb_min_live_attempts=gi('LATARB_MIN_LIVE_ATTEMPTS', 50), latarb_min_live_fill_rate=gf('LATARB_MIN_LIVE_FILL_RATE', 0.4), latarb_min_settle_samples=gi('LATARB_MIN_SETTLE_SAMPLES', 20), latarb_min_settle_win_rate=gf('LATARB_MIN_SETTLE_WIN_RATE', 0.52), latarb_min_settle_pnl=gf('LATARB_MIN_SETTLE_PNL', 0.0), latarb_fills_path=g('LATARB_FILLS_PATH', LATARB_FILLS_PATH), latarb_settle_path=g('LATARB_SETTLE_PATH', '~/latarb_settle.jsonl'), complement_arb_enabled=gb('COMPLEMENT_ARB_ENABLED', False), redeem_enabled=gb('REDEEM_ENABLED', False), polygon_rpc_url=g('POLYGON_RPC_URL', 'https://polygon-rpc.com'), redeem_max_gas_gwei=gf('REDEEM_MAX_GAS_GWEI', 300.0), latarb_shadow=gb('LATARB_SHADOW', True), latarb_shadow_path=g('LATARB_SHADOW_PATH', '~/latarb_shadow.csv'), latarb_shadow_min_age_ms=gf('LATARB_SHADOW_MIN_AGE_MS', 0.0), latarb_shadow_throttle_ms=gf('LATARB_SHADOW_THROTTLE_MS', 3000.0), latarb_shadow_max_age_ms=gf('LATARB_SHADOW_MAX_AGE_MS', 250.0), min_top_book_usdc=gf('MIN_TOP_BOOK_USDC', 6.0), max_spread_pct=gf('MAX_SPREAD_PCT', 0.1), max_consecutive_losses=gi('MAX_CONSECUTIVE_LOSSES', 4), prob_shrink=gf('PROB_SHRINK', 1.0), time_decay_exit_ttc_s=gi('TIME_DECAY_EXIT_TTC_S', 90), ws_shard_count=gi('WS_SHARD_COUNT', 2), discovery_interval_s=gf('DISCOVERY_INTERVAL_S', 10.0), event_driven=gb('EVENT_DRIVEN', True), eval_debounce_ms=gf('EVAL_DEBOUNCE_MS', 400.0), max_concurrent_evals=gi('MAX_CONCURRENT_EVALS', 5), adaptive_kelly=gb('ADAPTIVE_KELLY', True), metrics_enabled=gb('METRICS_ENABLED', True), dry_run_fill_prob=gf('DRY_RUN_FILL_PROB', 0.7), dry_run_latency_ms=gf('DRY_RUN_LATENCY_MS', 50.0), calibration_log_path=g('CALIBRATION_LOG_PATH', '~/calibration.csv'), calibration_log_enabled=gb('CALIBRATION_LOG_ENABLED', True), prob_model=g('PROB_MODEL', 'gbm_v183'), reconcile_fills_interval_s=gf('RECONCILE_FILLS_INTERVAL_S', 30.0), drift_halt_threshold_shares=gf('DRIFT_HALT_THRESHOLD_SHARES', 0.01), drift_check_concurrency=int(gf('DRIFT_CHECK_CONCURRENCY', 4)), min_proven_samples=gi('MIN_PROVEN_SAMPLES', 200), min_proven_edge=gf('MIN_PROVEN_EDGE', 0.005), max_adverse_bps=gf('MAX_ADVERSE_BPS', 40.0), shadow_probe_enabled=gb('SHADOW_PROBE_ENABLED', True), adverse_select_gate=gb('ADVERSE_SELECT_GATE', True), adverse_ewma_alpha=gf('ADVERSE_EWMA_ALPHA', 0.1), entry_mode=g('ENTRY_MODE', 'maker').lower(), maker_join_ticks=gi('MAKER_JOIN_TICKS', 0), fast_exit_drop_pct=gf('FAST_EXIT_DROP_PCT', 0.06), fast_exit_sustain=gi('FAST_EXIT_SUSTAIN', 2), trail_stop_pct=gf('TRAIL_STOP_PCT', 0.12), trail_sustain=gi('TRAIL_SUSTAIN', 2), trail_arm_level=gf('TRAIL_ARM_LEVEL', 0.65), forced_exit_hold_if_winning=gb('FORCED_EXIT_HOLD_IF_WINNING', True), forced_exit_hold_prob=gf('FORCED_EXIT_HOLD_PROB', 0.6), partial_tp_enabled=gb('PARTIAL_TP_ENABLED', True), tp_mode=g('TP_MODE', 'confidence').lower(), tp1_pct=gf('TP1_PCT', 0.35), tp1_clip_pct=gf('TP1_CLIP_PCT', 0.4), tp1_breakeven_stop=gb('TP1_BREAKEVEN_STOP', True), conf_scale=gf('CONF_SCALE', 1.0), conf_min_clip=gf('CONF_MIN_CLIP', 0.3), conf_max_clip=gf('CONF_MAX_CLIP', 0.95), taker_fee_bps=gf('TAKER_FEE_BPS', 20.0), category_fee_rate=gf('CATEGORY_FEE_RATE', 0.07), cycle_s=gi('CYCLE_S', 300), balance_refresh_s=gf('BALANCE_REFRESH_S', 5.0), maker_gtd_ttl_s=gf('MAKER_GTD_TTL_S', 120.0), capital_shock_pct=gf('CAPITAL_SHOCK_PCT', 0.1), capital_shock_floor_usdc=gf('CAPITAL_SHOCK_FLOOR_USDC', 2.0), max_net_bankroll_mult=gf('MAX_NET_BANKROLL_MULT', 1.0), max_gross_bankroll_mult=gf('MAX_GROSS_BANKROLL_MULT', 2.0), halt_on_capital_shock=gb('HALT_ON_CAPITAL_SHOCK', True), per_coin_crossover=gb('PER_COIN_CROSSOVER', True), auto_flatten_on_halt=gb('AUTO_FLATTEN_ON_HALT', False), spread_edge_mult=gf('SPREAD_EDGE_MULT', 0.2), sigma_edge_mult=gf('SIGMA_EDGE_MULT', 0.1), kelly_hold_to_expiry_rate=gf('KELLY_HOLD_TO_EXPIRY_RATE', 0.0), max_gross_exposure_usdc=gf('MAX_GROSS_EXPOSURE_USDC', 400.0), ev_exit_buffer=gf('EV_EXIT_BUFFER', 0.0), max_daily_loss_pct=gf('MAX_DAILY_LOSS_PCT', 0.05), max_monthly_loss=gf('MAX_MONTHLY_LOSS', 800.0), max_drawdown_from_peak=gf('MAX_DRAWDOWN_FROM_PEAK', 50.0), min_edge_margin=gf('MIN_EDGE_MARGIN', 0.005), momentum_weight=gf('MOMENTUM_WEIGHT', 0.0), market_anchor_weight=gf('MARKET_ANCHOR_WEIGHT', 0.5), max_model_disagreement=gf('MAX_MODEL_DISAGREEMENT', 0.06), anchor_edge_path=gb('ANCHOR_EDGE_PATH', True), salvage_floor=gf('SALVAGE_FLOOR', 0.05), whale_trade_usdc=gf('WHALE_TRADE_USDC', 5000.0), whale_cooldown_s=gf('WHALE_COOLDOWN_S', 3.0)).rescale_for_cycle()
+        return cls(private_key=pk, proxy_address=proxy, signature_type=gi('POLYMARKET_SIGNATURE_TYPE', 2), clob_url=g('CLOB_URL', g('CLOB_API_URL', 'https://clob.polymarket.com')).rstrip('/ '), gamma_url=g('GAMMA_URL', g('GAMMA_API_URL', 'https://gamma-api.polymarket.com')).rstrip('/ '), chain_id=gi('CHAIN_ID', 137), coins=[c.strip().upper() for c in g('COINS', g('BINANCE_COINS', 'BTC,ETH,SOL')).split(',') if c.strip()], min_order_size=gf('MIN_ORDER_USDC', 2.0), max_order_size=gf('MAX_ORDER_USDC', 25.0), max_position=gf('MAX_POSITION_USDC', 100.0), max_bankroll_fraction=gf('MAX_BANKROLL_FRACTION', 0.1), max_daily_loss=gf('MAX_DAILY_LOSS', 50.0), max_open_orders=gi('MAX_OPEN_ORDERS', 15), rate_limit=gi('ORDER_RATE_LIMIT_PER_SEC', gi('ORDER_RATE_LIMIT', 12)), book_max_age_ms=gf('MAX_BOOK_AGE_MS', 500.0), max_net_exposure_usdc=gf('MAX_NET_EXPOSURE_USDC', 200.0), dry_run=gb('DRY_RUN', True), log_level=g('LOG_LEVEL', 'INFO'), min_edge=gf('MIN_EDGE', 0.012), entry_start_s=gi('ENTRY_START_S', 15), entry_end_s=gi('ENTRY_END_S', 260), strategy_interval_s=gf('STRATEGY_INTERVAL_S', 1.5), kelly_fraction=gf('KELLY_FRACTION', 0.18), sustain_ticks=gi('SUSTAIN_TICKS', 1), stop_loss_prob=gf('STOP_LOSS_PROB', 0.43), forced_exit_ttc_s=gi('FORCED_EXIT_TTC_S', 25), latency_arb_enabled=gb('LATENCY_ARB_ENABLED', False), latency_arb_edge=gf('LATENCY_ARB_EDGE', 0.02), latency_arb_cooldown=gf('LATENCY_ARB_COOLDOWN_S', 2.0), latency_arb_min_prob=gf('LATENCY_ARB_MIN_PROB', 0.58), latarb_min_proven_signals=gi('LATARB_MIN_PROVEN_SIGNALS', 200), latarb_min_win_rate=gf('LATARB_MIN_WIN_RATE', 0.52), latarb_min_total_pnl=gf('LATARB_MIN_TOTAL_PNL', 0.0), require_latarb_live_proof=gb('REQUIRE_LATARB_LIVE_PROOF', False), latarb_bootstrap_live=gb('LATARB_BOOTSTRAP_LIVE', True), latarb_min_live_attempts=gi('LATARB_MIN_LIVE_ATTEMPTS', 50), latarb_min_live_fill_rate=gf('LATARB_MIN_LIVE_FILL_RATE', 0.4), latarb_min_settle_samples=gi('LATARB_MIN_SETTLE_SAMPLES', 20), latarb_min_settle_win_rate=gf('LATARB_MIN_SETTLE_WIN_RATE', 0.52), latarb_min_settle_pnl=gf('LATARB_MIN_SETTLE_PNL', 0.0), latarb_fills_path=g('LATARB_FILLS_PATH', LATARB_FILLS_PATH), latarb_settle_path=g('LATARB_SETTLE_PATH', '~/latarb_settle.jsonl'), complement_arb_enabled=gb('COMPLEMENT_ARB_ENABLED', False), redeem_enabled=gb('REDEEM_ENABLED', False), polygon_rpc_url=g('POLYGON_RPC_URL', 'https://polygon-rpc.com'), redeem_max_gas_gwei=gf('REDEEM_MAX_GAS_GWEI', 300.0), redeem_min_priority_gwei=gf('REDEEM_MIN_PRIORITY_GWEI', 30.0), latarb_shadow=gb('LATARB_SHADOW', True), latarb_shadow_path=g('LATARB_SHADOW_PATH', '~/latarb_shadow.csv'), latarb_shadow_min_age_ms=gf('LATARB_SHADOW_MIN_AGE_MS', 0.0), latarb_shadow_throttle_ms=gf('LATARB_SHADOW_THROTTLE_MS', 3000.0), latarb_shadow_max_age_ms=gf('LATARB_SHADOW_MAX_AGE_MS', 250.0), min_top_book_usdc=gf('MIN_TOP_BOOK_USDC', 6.0), max_spread_pct=gf('MAX_SPREAD_PCT', 0.1), max_consecutive_losses=gi('MAX_CONSECUTIVE_LOSSES', 4), prob_shrink=gf('PROB_SHRINK', 1.0), time_decay_exit_ttc_s=gi('TIME_DECAY_EXIT_TTC_S', 90), ws_shard_count=gi('WS_SHARD_COUNT', 2), discovery_interval_s=gf('DISCOVERY_INTERVAL_S', 10.0), event_driven=gb('EVENT_DRIVEN', True), eval_debounce_ms=gf('EVAL_DEBOUNCE_MS', 400.0), max_concurrent_evals=gi('MAX_CONCURRENT_EVALS', 5), adaptive_kelly=gb('ADAPTIVE_KELLY', True), metrics_enabled=gb('METRICS_ENABLED', True), dry_run_fill_prob=gf('DRY_RUN_FILL_PROB', 0.7), dry_run_latency_ms=gf('DRY_RUN_LATENCY_MS', 50.0), calibration_log_path=g('CALIBRATION_LOG_PATH', '~/calibration.csv'), calibration_log_enabled=gb('CALIBRATION_LOG_ENABLED', True), prob_model=g('PROB_MODEL', 'gbm_v183'), reconcile_fills_interval_s=gf('RECONCILE_FILLS_INTERVAL_S', 30.0), drift_halt_threshold_shares=gf('DRIFT_HALT_THRESHOLD_SHARES', 0.01), drift_check_concurrency=int(gf('DRIFT_CHECK_CONCURRENCY', 4)), min_proven_samples=gi('MIN_PROVEN_SAMPLES', 200), min_proven_edge=gf('MIN_PROVEN_EDGE', 0.005), max_adverse_bps=gf('MAX_ADVERSE_BPS', 40.0), shadow_probe_enabled=gb('SHADOW_PROBE_ENABLED', True), adverse_select_gate=gb('ADVERSE_SELECT_GATE', True), adverse_ewma_alpha=gf('ADVERSE_EWMA_ALPHA', 0.1), adverse_ewma_halflife_s=gf('ADVERSE_EWMA_HALFLIFE_S', 300.0), adverse_ewma_clamp_bps=gf('ADVERSE_EWMA_CLAMP_BPS', 120.0), book_resync_s=gf('BOOK_RESYNC_S', 120.0), entry_mode=g('ENTRY_MODE', 'maker').lower(), maker_join_ticks=gi('MAKER_JOIN_TICKS', 0), fast_exit_drop_pct=gf('FAST_EXIT_DROP_PCT', 0.06), fast_exit_sustain=gi('FAST_EXIT_SUSTAIN', 2), trail_stop_pct=gf('TRAIL_STOP_PCT', 0.12), trail_sustain=gi('TRAIL_SUSTAIN', 2), trail_arm_level=gf('TRAIL_ARM_LEVEL', 0.65), forced_exit_hold_if_winning=gb('FORCED_EXIT_HOLD_IF_WINNING', True), forced_exit_hold_prob=gf('FORCED_EXIT_HOLD_PROB', 0.6), partial_tp_enabled=gb('PARTIAL_TP_ENABLED', True), tp_mode=g('TP_MODE', 'confidence').lower(), tp1_pct=gf('TP1_PCT', 0.35), tp1_clip_pct=gf('TP1_CLIP_PCT', 0.4), tp1_breakeven_stop=gb('TP1_BREAKEVEN_STOP', True), conf_scale=gf('CONF_SCALE', 1.0), conf_min_clip=gf('CONF_MIN_CLIP', 0.3), conf_max_clip=gf('CONF_MAX_CLIP', 0.95), taker_fee_bps=gf('TAKER_FEE_BPS', 20.0), category_fee_rate=gf('CATEGORY_FEE_RATE', 0.07), cycle_s=gi('CYCLE_S', 300), balance_refresh_s=gf('BALANCE_REFRESH_S', 5.0), maker_gtd_ttl_s=gf('MAKER_GTD_TTL_S', 120.0), capital_shock_pct=gf('CAPITAL_SHOCK_PCT', 0.1), capital_shock_floor_usdc=gf('CAPITAL_SHOCK_FLOOR_USDC', 2.0), max_net_bankroll_mult=gf('MAX_NET_BANKROLL_MULT', 1.0), max_gross_bankroll_mult=gf('MAX_GROSS_BANKROLL_MULT', 2.0), halt_on_capital_shock=gb('HALT_ON_CAPITAL_SHOCK', True), per_coin_crossover=gb('PER_COIN_CROSSOVER', True), auto_flatten_on_halt=gb('AUTO_FLATTEN_ON_HALT', False), spread_edge_mult=gf('SPREAD_EDGE_MULT', 0.2), sigma_edge_mult=gf('SIGMA_EDGE_MULT', 0.1), kelly_hold_to_expiry_rate=gf('KELLY_HOLD_TO_EXPIRY_RATE', 0.0), max_gross_exposure_usdc=gf('MAX_GROSS_EXPOSURE_USDC', 400.0), ev_exit_buffer=gf('EV_EXIT_BUFFER', 0.0), max_daily_loss_pct=gf('MAX_DAILY_LOSS_PCT', 0.05), max_monthly_loss=gf('MAX_MONTHLY_LOSS', 800.0), max_drawdown_from_peak=gf('MAX_DRAWDOWN_FROM_PEAK', 50.0), min_edge_margin=gf('MIN_EDGE_MARGIN', 0.005), momentum_weight=gf('MOMENTUM_WEIGHT', 0.0), market_anchor_weight=gf('MARKET_ANCHOR_WEIGHT', 0.5), max_model_disagreement=gf('MAX_MODEL_DISAGREEMENT', 0.06), anchor_edge_path=gb('ANCHOR_EDGE_PATH', True), salvage_floor=gf('SALVAGE_FLOOR', 0.05), whale_trade_usdc=gf('WHALE_TRADE_USDC', 5000.0), whale_cooldown_s=gf('WHALE_COOLDOWN_S', 3.0)).rescale_for_cycle()
 
     def rescale_for_cycle(self) -> 'Config':
         if self.cycle_s != 300 and self.cycle_s > 0:
@@ -512,6 +527,19 @@ class Config:
             errs.append(f"entry_mode must be 'taker' or 'maker', got {self.entry_mode}")
         if not 0.0 < self.adverse_ewma_alpha <= 1.0:
             errs.append(f'adverse_ewma_alpha must be in (0, 1], got {self.adverse_ewma_alpha}')
+        if self.adverse_ewma_clamp_bps < 0.0:
+            errs.append(f'adverse_ewma_clamp_bps must be >= 0, got {self.adverse_ewma_clamp_bps}')
+        if 0.0 < self.adverse_ewma_clamp_bps < self.max_adverse_bps:
+            errs.append(f'adverse_ewma_clamp_bps ({self.adverse_ewma_clamp_bps}) below max_adverse_bps ({self.max_adverse_bps}) would clamp the gate shut permanently')
+        if self.book_resync_s and self.book_resync_s < 15.0:
+            errs.append(f'book_resync_s must be 0 (off) or >= 15, got {self.book_resync_s}')
+        # R25: the venue floor is 5 shares, so a clip below 5 x entry price can
+        # never be sent. Warn loudly rather than discovering it as silent skips.
+        _floor_cost = _VENUE_MARKET_BUY_MIN_SHARES * 0.5
+        if self.max_order_size < _floor_cost:
+            errs.append(f'max_order_size (${self.max_order_size:.2f}) cannot buy the venue minimum of {_VENUE_MARKET_BUY_MIN_SHARES:.0f} shares at a 0.50 entry (${_floor_cost:.2f}) - every order would be skipped')
+        elif self.min_order_size < _floor_cost:
+            log.warning('min_order_size ($%.2f) < %.0f shares x 0.50 ($%.2f): entries above $%.2f/share can only fire by sizing up toward max_order_size ($%.2f)', self.min_order_size, _VENUE_MARKET_BUY_MIN_SHARES, _floor_cost, self.min_order_size / _VENUE_MARKET_BUY_MIN_SHARES, self.max_order_size)
         if not 0.0 < self.tp1_pct < 5.0:
             errs.append(f'tp1_pct must be in (0, 5), got {self.tp1_pct}')
         if not 0.1 <= self.tp1_clip_pct <= 0.95:
@@ -566,6 +594,97 @@ def _tick_decimals(tick_size: float) -> int:
         return max(0, -Decimal(str(tick_size)).normalize().as_tuple().exponent)
     except (InvalidOperation, TypeError, ValueError):
         return 2
+
+# R18 FIX (live blocker, 2026-07-27 log): Polymarket rejects FOK/FAK ("market")
+# BUY orders whose maker amount carries more than 2 decimals:
+#   400 'invalid amounts, the market buy orders maker amount supports a max
+#        accuracy of 2 decimals, taker amount a max of 4 decimals'
+# py-clob-client-v2 derives  maker = round_down(size, 2) * round_normal(price, dp)
+# (order_builder/builder.py::get_order_amounts), so a share count such as
+# 2.66/0.53 = 5.018868 becomes taker 5.01 and maker 2.6553 -> rejected. 14 of the
+# operator's 31 live order attempts died here. The share count must therefore be a
+# multiple of the smallest increment whose USDC cost lands on a whole cent.
+_VENUE_MARKET_BUY_MIN_SHARES = 5.0  # Polymarket minimum clip
+_VENUE_MARKET_BUY_UP_TOLERANCE = 1.25  # never overshoot the requested clip by more
+
+
+def venue_min_shares(mkt: Any=None) -> float:
+    """Share floor the CLOB will accept for this market.
+
+    R25 (2026-07-27): every book the bot trades publishes min_order_size=5
+    (btc/eth/sol, 5m and 15m, checked live). An order below it is rejected by
+    the venue, so the bot must never build one - in DRY_RUN either, or paper
+    'fills' clips that live would 400.
+    """
+    try:
+        v = float(getattr(mkt, 'min_order_size', 0.0) or 0.0)
+    except (TypeError, ValueError):
+        v = 0.0
+    return v if v > 0.0 else _VENUE_MARKET_BUY_MIN_SHARES
+
+
+def _ioc_buy_share_step(price: float) -> Decimal:
+    """Smallest share increment (>= 0.01) whose cost at `price` is a whole cent."""
+    try:
+        p = Decimal(str(price))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal('1')
+    dp = max(0, -p.as_tuple().exponent)
+    scale = 10 ** dp
+    p_int = int(p.scaleb(dp))
+    if p_int <= 0:
+        return Decimal('1')
+    # size is rounded down to 2 dp by the SDK, so work in hundredths of a share.
+    step_hundredths = scale // math.gcd(p_int, scale)
+    return Decimal(step_hundredths) / Decimal(100)
+
+
+def _float_safe_hundredths(q: Decimal) -> float:
+    """Return a float that the SDK's floor(x*100)/100 still reads as `q`.
+
+    py-clob-client-v2 rounds size with floor(x * 100) / 100, and binary floats
+    make that lossy: 8.2 * 100 == 819.9999999999999, so a clean 8.20 share order
+    is submitted as 8.19 and the maker amount picks up two extra decimals again.
+    """
+    target = int(q.scaleb(2).to_integral_value(rounding=ROUND_DOWN))
+    v = float(q)
+    for _ in range(8):
+        if math.floor(v * 100.0) >= target:
+            return v
+        v = math.nextafter(v, math.inf)
+    return v
+
+
+def quantize_ioc_buy_shares(shares: float, price: float, max_usdc: Optional[float]=None, min_shares: Optional[float]=None) -> float:
+    """Round a FOK/FAK BUY share count onto a venue-legal amount grid.
+
+    Rounds down by default; rounds up to the venue's share minimum when the
+    extra cost stays inside both the size-up tolerance and `max_usdc`.
+    R25: returns 0.0 whenever no size >= the venue minimum fits, because the
+    CLOB rejects anything smaller (min_order_size=5 on every market this bot
+    trades) - the caller skips instead of eating a 400.
+    """
+    if not math.isfinite(shares) or not math.isfinite(price) or shares <= 0.0 or price <= 0.0:
+        return 0.0
+    floor_shares = Decimal(str(min_shares if min_shares and min_shares > 0 else _VENUE_MARKET_BUY_MIN_SHARES))
+    step = _ioc_buy_share_step(price)
+    requested = Decimal(str(shares)).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+    q = (requested / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if q < floor_shares:
+        budget = Decimal(str(shares)) * Decimal(str(_VENUE_MARKET_BUY_UP_TOLERANCE))
+        if max_usdc is not None and max_usdc > 0:
+            budget = min(budget, Decimal(str(max_usdc)) / Decimal(str(price)))
+        need = (floor_shares / step).to_integral_value(rounding=ROUND_CEILING) * step
+        if need <= budget + Decimal('0.001'):
+            q = need
+        else:
+            # R25: a sub-minimum clip is a guaranteed venue rejection, so skip
+            # the trade instead of sending one the CLOB will refuse.
+            return 0.0
+    if q <= 0 or q + Decimal('1E-9') < floor_shares:
+        return 0.0
+    return _float_safe_hundredths(q.quantize(Decimal('0.01'), rounding=ROUND_DOWN))
+
 
 def snap_price(price: float, tick_size: float, side: str='BUY', _decimals: Optional[int]=None, _max_ticks: Optional[int]=None) -> float:
     if not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0.0:
@@ -755,13 +874,22 @@ def _connect_polygon_rpc(chain_id: int=137, primary: str='', timeout: float=8.0,
             time.sleep(1.5 * (attempt + 1))
     return (None, '', errors)
 
-_RPC_TRANSPORT_MARKERS: Tuple[str, ...] = ('connection', 'timeout', 'timed out', 'max retries', 'temporarily unavailable', 'service unavailable', 'bad gateway', 'gateway time-out', 'too many requests', 'tenant disabled', 'api key', 'unauthorized', 'forbidden', '403', '429', '500', '502', '503', '504', 'ssl', 'name or service not known', 'nodename nor servname')
+_RPC_TRANSPORT_MARKERS: Tuple[str, ...] = ('connection', 'timeout', 'timed out', 'max retries', 'temporarily unavailable', 'service unavailable', 'bad gateway', 'gateway time-out', 'too many requests', 'tenant disabled', 'api key', 'unauthorized', 'forbidden', 'ssl', 'name or service not known', 'nodename nor servname')
+# R20 FIX (2026-07-27 log): the HTTP status codes used to live in the substring
+# list above, so a node-side rejection carrying a wei figure -
+#   -32000 'gas tip cap 2000000000, minimum needed 25000000000'
+# - matched '500' inside '25000000000' and was misread as a transport fault. The
+# healthy endpoint was then dropped and re-selected 144 times in one session.
+# Status codes must match as standalone tokens, never as digits inside a number.
+_RPC_TRANSPORT_STATUS_RE = re.compile(r'(?<![0-9])(403|429|500|502|503|504)(?![0-9])')
 
 def _is_rpc_transport_error(exc: BaseException) -> bool:
     """True for endpoint/transport faults (rotate provider), False for logic errors
     such as 'condition is not resolved on-chain yet' (rotating would not help)."""
     text = f'{type(exc).__name__}: {exc}'.lower()
-    return any((marker in text for marker in _RPC_TRANSPORT_MARKERS))
+    if any((marker in text for marker in _RPC_TRANSPORT_MARKERS)):
+        return True
+    return bool(_RPC_TRANSPORT_STATUS_RE.search(text))
 
 class RedemptionRPCUnavailable(RuntimeError):
     """No Polygon RPC endpoint is currently usable. Transient and retryable -
@@ -1147,6 +1275,8 @@ class PolyClient:
         self.active_mode = ''
         self.lib_broken = False
         self._token_to_market: Dict[str, Market] = {}
+        self._tick_refresh_ts: Dict[str, float] = {}
+        self._sdk_tick_cache_misses: int = 0
         # One worker per coin for concurrent LatArb FAK sign+POST, plus headroom for directional.
         _n_coins = max(1, len(cfg.coins or []))
         self._order_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(4, _n_coins + 2), thread_name_prefix='order-io')
@@ -1162,7 +1292,67 @@ class PolyClient:
         if m and 0 < tick < 1:
             old = m.tick_sizes.get(token_id)
             m.set_tick(token_id, tick)
-            self.log.info('Tick updated  %s: %s -> %s', token_id[:16], old, tick)
+            if old is None or abs(float(old) - float(tick)) > 1e-12:
+                self.invalidate_sdk_tick(token_id)
+                self.log.info('Tick updated  %s: %s -> %s', token_id[:16], old, tick)
+
+    def invalidate_sdk_tick(self, token_id: str) -> bool:
+        """Drop py-clob-client-v2's memoised tick for one token.
+
+        R27 (verified against py_clob_client_v2 1.1.0): ClobClient.get_tick_size
+        caches per token in a private dict and never expires it, and
+        __resolve_tick_size raises 'invalid tick size (X), minimum for the market
+        is Y' *before signing* when the tick we pass is finer than that cache.
+        Polymarket re-ticks a market from 0.01 to 0.001 as it approaches an
+        extreme (observed live on btc-updown-15m at 0.995), so refreshing our
+        own copy without clearing the SDK's would stop order flow dead.
+        """
+        sdk = self.sdk
+        if sdk is None or not token_id:
+            return False
+        dropped = False
+        for attr in ('_ClobClient__tick_sizes', '__tick_sizes', 'tick_sizes'):
+            cache = getattr(sdk, attr, None)
+            if isinstance(cache, dict) and token_id in cache:
+                cache.pop(token_id, None)
+                dropped = True
+        if not dropped:
+            self._sdk_tick_cache_misses += 1
+            if self._sdk_tick_cache_misses in (1, 50):
+                self.log.debug('SDK tick cache not found on %s (nothing to invalidate)', type(sdk).__name__)
+        return dropped
+
+    async def refresh_tick(self, token_id: str, reason: str='') -> Optional[float]:
+        """Re-read the venue tick for one token and resync both caches."""
+        if not token_id or self.session is None:
+            return None
+        now = time.monotonic()
+        last = self._tick_refresh_ts.get(token_id, 0.0)
+        if now - last < _TICK_REFRESH_COOLDOWN_S:
+            return None
+        self._tick_refresh_ts[token_id] = now
+        try:
+            async with self.session.get(f'{self.cfg.clob_url}/tick-size', params={'token_id': token_id}, timeout=aiohttp.ClientTimeout(total=4)) as r:
+                if not r.ok:
+                    return None
+                d = await r.json(content_type=None)
+        except Exception as e:
+            self.log.debug('tick refresh %s failed: %s', token_id[:12], e)
+            return None
+        raw = d if isinstance(d, (int, float, str)) else (d or {}).get('minimum_tick_size') or (d or {}).get('tick_size') or (d or {}).get('minTickSize')
+        try:
+            ts = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not 0.0 < ts < 1.0:
+            return None
+        m = self._token_to_market.get(token_id)
+        prev = m.tick_sizes.get(token_id) if m else None
+        if m is not None and (prev is None or abs(float(prev) - ts) > 1e-12):
+            self.log.info('TICK REFRESH %s: %s -> %s%s', token_id[:12], prev, ts, f' ({reason})' if reason else '')
+        self._persist_tick(token_id, ts)
+        self.invalidate_sdk_tick(token_id)
+        return ts
 
     async def _build_sdk(self, sig_type: int) -> bool:
         if not _HAS_SDK:
@@ -1369,18 +1559,40 @@ class PolyClient:
             self.log.warning('list_open_orders failed: %s', e)
             raise
 
-    async def place_order(self, token_id: str, side: str, price: float, size_usdc: float, order_type: str='GTC', neg_risk: bool=False, tick_size: float=0.01, expiration_s: float=0.0, post_only: bool=False) -> Optional[PlacementResult]:
+    async def place_order(self, token_id: str, side: str, price: float, size_usdc: float, order_type: str='GTC', neg_risk: bool=False, tick_size: float=0.01, expiration_s: float=0.0, post_only: bool=False, _tick_retry: bool=False) -> Optional[PlacementResult]:
         if not self.sdk:
             return None
+        # R27: an extreme price means the venue may already have re-ticked this
+        # market; refresh (cooldown-guarded) before we snap onto a stale grid.
+        if (price >= _TICK_EXTREME_HI or price <= _TICK_EXTREME_LO) and tick_size >= 0.01 - 1e-12:
+            fresh = await self.refresh_tick(token_id, reason=f'price {price:.4f} in re-tick band')
+            if fresh and 0.0 < fresh < 1.0:
+                tick_size = fresh
         price = snap_price(price, tick_size, side)
-        if side in ('BUY', Side.BUY):
-            shares = round(size_usdc / max(price, 0.001), 6)
-            if shares < 1.0:
-                shares = 1.0
-        else:
-            shares = round(size_usdc / max(price, 0.001), 6)
-            if shares < 1.0:
-                shares = 1.0
+        shares = round(size_usdc / max(price, 0.001), 6)
+        if shares < 1.0:
+            shares = 1.0
+        if side in ('BUY', Side.BUY) and (order_type or 'GTC').upper() in ('FOK', 'FAK'):
+            # R18: keep the maker amount on a whole cent or the venue 400s the order.
+            # R25: and never below the market's published share minimum.
+            _mkt_ref = self._token_to_market.get(token_id)
+            _mos = venue_min_shares(_mkt_ref)
+            legal = quantize_ioc_buy_shares(shares, price, max_usdc=self.cfg.max_order_size, min_shares=_mos)
+            if legal <= 0.0:
+                self.log.info('IOC BUY %s: $%.2f buys %.2f shares @ %.4f but the venue floor is %.0f shares ($%.2f) and the step is %s - skipping (raise MIN_ORDER_USDC/MAX_ORDER_USDC to trade this price)', token_id[:12], size_usdc, shares, price, _mos, _mos * price, _ioc_buy_share_step(price))
+                return None
+            if abs(legal - shares) > 1e-09:
+                self.log.debug('IOC BUY %s: size %.4f -> %.2f shares (maker $%.2f) for 2-decimal maker amount', token_id[:12], shares, legal, legal * price)
+            shares = legal
+        if side in ('SELL', Side.SELL):
+            _mkt_sell = self._token_to_market.get(token_id)
+            _sell_floor = venue_min_shares(_mkt_sell)
+            if shares + 1e-09 < _sell_floor:
+                self.log.warning('SELL %s: %.4f shares is below the venue floor of %.0f - refusing (dust must be redeemed, not sold)', token_id[:12], shares, _sell_floor)
+                return None
+            shares = math.floor(shares * 100.0) / 100.0
+            if shares + 1e-09 < _sell_floor:
+                return None
         loop = asyncio.get_running_loop()
         side_enum = Side.BUY if side in ('BUY', Side.BUY) else Side.SELL
         sdk_side = _SDK_BUY if side_enum == Side.BUY else _SDK_SELL
@@ -1473,6 +1685,12 @@ class PolyClient:
         except Exception as e:
             es = str(e)
             el = es.lower()
+            if ('tick size' in el or 'invalid price' in el) and not _tick_retry:
+                fresh = await self.refresh_tick(token_id, reason='venue rejected the tick')
+                self.invalidate_sdk_tick(token_id)
+                if fresh and abs(fresh - tick_size) > 1e-12:
+                    self.log.warning('Tick rejection on %s (%s) - retrying once at tick %s', token_id[:12], es[:80], fresh)
+                    return await self.place_order(token_id, side, price, size_usdc, order_type, neg_risk, fresh, expiration_s=expiration_s, post_only=post_only, _tick_retry=True)
             if any((k in el for k in ('balance', 'insufficient', 'allowance'))):
                 self.log.warning('Insufficient balance/allowance  token=%s', token_id[:16])
             elif any((k in el for k in ('invalid signature', 'bad signature', 'unauthorized', 'authentication failed'))):
@@ -1570,10 +1788,17 @@ class _OrderErrorClass(str, Enum):
     NETWORK = 'network'
     AUTH_FAILURE = 'auth'
     BALANCE = 'balance'
+    NO_MATCH = 'no_match'
     REJECTION = 'rejection'
 
 def _classify_order_error(exc: BaseException) -> _OrderErrorClass:
     s = str(exc).lower()
+    # R21 FIX (2026-07-27 log): 'no orders found to match with FAK order' is the
+    # documented outcome of a fill-and-kill that found no crossing liquidity - a
+    # miss, not a venue rejection. Counting it toward the 5-consecutive-reject
+    # halt let ordinary thin books trip a trading halt.
+    if 'no orders found to match' in s or 'fak orders are partially filled or killed' in s:
+        return _OrderErrorClass.NO_MATCH
     if '429' in s or 'rate limit' in s or 'too many' in s:
         return _OrderErrorClass.RATE_LIMIT
     if any((k in s for k in ('timeout', 'connectionreset', 'connection reset', 'connection refused', 'eof', 'disconnected', 'temporarily unavailable', '503', '502', '504', '500', '425', 'too early', 'maintenance'))):
@@ -1641,6 +1866,7 @@ class OrderManager:
         self._reconcile_fills_lock = asyncio.Lock()
         # Per-strategy adverse EWMA so directional toxic fills do not throttle LatArb FOKs.
         self._adverse_ewma_by_strategy: Dict[str, float] = {}
+        self._adverse_ewma_ts: Dict[str, float] = {}
         self._shadow_sink: Optional[Callable[[dict], Any]] = None
         # F9: durable-enough entry strategy tag (token_id -> 'latarb'|'directional')
         # so fill attribution does not depend only on volatile Market.latarb_hold*.
@@ -1662,14 +1888,42 @@ class OrderManager:
     def record_adverse(self, adverse_bps: float, strategy: str='directional') -> None:
         key = (strategy or 'directional').lower()
         a = self.cfg.adverse_ewma_alpha
-        prev = self._adverse_ewma_by_strategy.get(key)
+        # R29: one outlier fill (+151bps against a 40bps cap in the operator's
+        # 2026-07-27 session) latched the gate shut for two whole market cycles.
+        # Winsorise each observation so a single print cannot dominate, while a
+        # genuinely toxic regime - repeated observations - still trips the gate.
+        clamp = float(getattr(self.cfg, 'adverse_ewma_clamp_bps', 0.0) or 0.0)
+        if clamp > 0.0 and math.isfinite(adverse_bps) and abs(adverse_bps) > clamp:
+            self.log.info('ADVERSE CLAMP %s: %+.1fbps -> %+.1fbps (outlier winsorised)', key, adverse_bps, math.copysign(clamp, adverse_bps))
+            adverse_bps = math.copysign(clamp, adverse_bps)
+        prev = self.adverse_ewma(key)
         if prev is None:
             self._adverse_ewma_by_strategy[key] = adverse_bps
         else:
             self._adverse_ewma_by_strategy[key] = (1.0 - a) * prev + a * adverse_bps
+        self._adverse_ewma_ts[key] = time.monotonic()
 
     def adverse_ewma(self, strategy: str='directional') -> Optional[float]:
-        return self._adverse_ewma_by_strategy.get((strategy or 'directional').lower())
+        """Adverse-selection EWMA, decayed toward 0 since the last observation.
+
+        R22 FIX (2026-07-27 log): the EWMA only moved when a fill arrived, so one
+        toxic patch (+151.4bps at 07:16) latched the LatArb gate shut for the
+        remaining ~2h50m of the session - 15,315 skips and not one further order.
+        The estimate is only about the fills it saw, so it has to lose confidence
+        with age: half-life ADVERSE_EWMA_HALFLIFE_S (default 300s, 0 disables).
+        """
+        key = (strategy or 'directional').lower()
+        val = self._adverse_ewma_by_strategy.get(key)
+        if val is None:
+            return None
+        half_life = float(getattr(self.cfg, 'adverse_ewma_halflife_s', 0.0) or 0.0)
+        if half_life <= 0.0:
+            return val
+        age = time.monotonic() - self._adverse_ewma_ts.get(key, 0.0)
+        if age <= 0.0:
+            return val
+        decayed = val * 0.5 ** (age / half_life)
+        return decayed if abs(decayed) >= 0.05 else 0.0
 
     def set_fill_replay_handler(self, handler: Callable[[dict], Any]) -> None:
         self._fill_replay_handler = handler
@@ -1806,7 +2060,13 @@ class OrderManager:
                     book_ref = mkt_ref.book_yes if token_id == mkt_ref.yes_token else mkt_ref.book_no
                 if otype_u_dry in ('FOK', 'FAK') and side == Side.BUY:
                     # P1: match live FAK â€” request shares = USDC/limit, depth-walk only asks <= limit.
-                    req_shares = size / max(price, 0.001)
+                    # R18: quantise exactly like the live path so paper sizes are venue-legal too.
+                    # R25: same floor as live or paper fills clips the venue would reject.
+                    _dry_mos = venue_min_shares(mkt_ref)
+                    req_shares = quantize_ioc_buy_shares(size / max(price, 0.001), price, max_usdc=self.cfg.max_order_size, min_shares=_dry_mos)
+                    if req_shares <= 0.0:
+                        self.log.info('DRY IOC BUY %s: $%.2f @ %.4f cannot reach the venue floor of %.0f shares ($%.2f) - skipping', token_id[:12], size, price, _dry_mos, _dry_mos * price)
+                        return None
                     if book_ref is not None and hasattr(book_ref, 'asks'):
                         rem = req_shares
                         cost = 0.0
@@ -1832,7 +2092,11 @@ class OrderManager:
                         matched_shares = round(req_shares, 6)
                         dry_fill_price = price
                 elif otype_u_dry in ('FOK', 'FAK') and side == Side.SELL:
-                    req_shares = size / max(price, 0.001)
+                    req_shares = math.floor(size / max(price, 0.001) * 100.0) / 100.0
+                    _dry_sell_floor = venue_min_shares(mkt_ref)
+                    if req_shares + 1e-09 < _dry_sell_floor:
+                        self.log.info('DRY SELL %s: %.2f shares below venue floor %.0f - skipping', token_id[:12], req_shares, _dry_sell_floor)
+                        return None
                     if book_ref is not None and mkt_ref is not None:
                         _dec, _mt = mkt_ref.tick_math(token_id)
                         entry_vwap = _fok_sweep_price_sell(book_ref, req_shares, tick_size, _dec, _mt)
@@ -1907,10 +2171,16 @@ class OrderManager:
                     await asyncio.sleep(1.0)
                 elif ec == _OrderErrorClass.NETWORK:
                     self.log.debug('network slot consumed (transient: %s)', str(e)[:80])
+                elif ec == _OrderErrorClass.NO_MATCH:
+                    pass
                 else:
                     async with self._lock:
                         self._rejects += 1
-                self.log.error('Order %s: %s', ec.value, str(e)[:120])
+                if ec == _OrderErrorClass.NO_MATCH:
+                    # R21: a killed FAK is a miss; the LatArb attempt counters already record it.
+                    self.log.info('%s %s %s: no crossing liquidity - killed (miss)', otype_u, side.value, token_id[:12])
+                else:
+                    self.log.error('Order %s: %s', ec.value, str(e)[:120])
                 return None
             elapsed_ms = (time.monotonic() - t0) * 1000
             if self._metrics:
@@ -2532,15 +2802,108 @@ class HyperPolyFeed:
         self._running = False
         self._snapshot_received: Set[str] = set()
         self._pending_subs: Dict[int, Set[str]] = {i: set() for i in range(self._shard_count)}
+        self._tick_sink: Optional[Callable[[str, float], Any]] = None
+        self._tick_seen: Dict[str, float] = {}
+        # R28: tokens whose local book disagreed with the venue's own best
+        # bid/ask on a delta - they need a full REST re-snapshot.
+        self._resync_needed: Set[str] = set()
+        self._resync_asked: Dict[str, float] = {}
+        self._drift_strikes: Dict[str, int] = {}
+        self._drift_events: int = 0
+        self._phantom_events: int = 0
         self._bg_tasks: Set[asyncio.Task] = set()
         self._shard_tasks: Dict[int, asyncio.Task] = {}
         self.log = get_logger('HyperFeed')
+
+    def set_tick_sink(self, sink: Callable[[str, float], Any]) -> None:
+        self._tick_sink = sink
+
+    def _note_tick(self, tid: str, raw: Any) -> None:
+        if raw is None or self._tick_sink is None:
+            return
+        try:
+            ts = float(raw)
+        except (TypeError, ValueError):
+            return
+        if not 0.0 < ts < 1.0 or abs(self._tick_seen.get(tid, 0.0) - ts) < 1e-12:
+            return
+        self._tick_seen[tid] = ts
+        try:
+            self._tick_sink(tid, ts)
+        except Exception as e:
+            self.log.debug('tick sink error %s: %s', tid[:10], e)
 
     def subscribe(self, tid: str) -> None:
         if tid not in self._token_set:
             self._token_set.add(tid)
             self._tokens.append(tid)
             self._books.setdefault(tid, OrderBook(token_id=tid))
+
+    @staticmethod
+    def _venue_top(change: dict) -> Tuple[Optional[float], Optional[float]]:
+        def _f(key: str) -> Optional[float]:
+            v = change.get(key)
+            if v is None or v == '':
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            return f if math.isfinite(f) else None
+        return (_f('best_bid'), _f('best_ask'))
+
+    @classmethod
+    def _delta_out_of_sync(cls, bk: 'OrderBook', change: dict) -> bool:
+        """Our reconstructed top disagrees with the venue's stated one.
+
+        Measured on 98,634 live frames: this disagrees on ~41% of frames for
+        reasons that are NOT our error (the field often carries the changed
+        price, or 1.0 for an empty ask side). It is therefore a *suspicion*,
+        not a verdict - callers require repeated strikes before acting.
+        Absent or unparseable values are always treated as agreement.
+        """
+        tol = 1e-06
+        vb, va = cls._venue_top(change)
+        lb, la = (bk.best_bid, bk.best_ask)
+        if vb is not None and vb > 0.0 and (lb is None or abs(lb - vb) > tol):
+            return True
+        if va is not None and 0.0 < va < 1.0 and (la is None or abs(la - va) > tol):
+            return True
+        return False
+
+    @classmethod
+    def _phantom_depth(cls, bk: 'OrderBook', change: dict) -> bool:
+        """Our book claims liquidity the venue says cannot exist.
+
+        Only this stops trading: a local best bid at or above the venue's best
+        ask (or a local ask at or below their bid) means we would sweep depth
+        that is not there. Everything softer is handled by a re-snapshot.
+        """
+        vb, va = cls._venue_top(change)
+        lb, la = (bk.best_bid, bk.best_ask)
+        if va is not None and 0.0 < va < 1.0 and lb is not None and lb > va + 1e-09:
+            return True
+        if vb is not None and vb > 0.0 and la is not None and la < vb - 1e-09:
+            return True
+        return False
+
+    def request_resync(self, tid: str) -> None:
+        """Queue a REST re-snapshot, at most one per token per cooldown."""
+        now = time.monotonic()
+        if now - self._resync_asked.get(tid, 0.0) < _BOOK_RESYNC_COOLDOWN_S:
+            return
+        self._resync_asked[tid] = now
+        self._resync_needed.add(tid)
+
+    def drift_stats(self) -> Tuple[int, int]:
+        """(soft drift repairs, phantom-depth withdrawals) since start."""
+        return (self._drift_events, self._phantom_events)
+
+    def take_resync_requests(self) -> List[str]:
+        """Drain the set of tokens whose local book needs a REST re-snapshot."""
+        pending = sorted(self._resync_needed)
+        self._resync_needed.clear()
+        return pending
 
     def book_ready(self, tid: str) -> bool:
         """True only after a clean snapshot and not crossed (LatArb must not trade on reconnect ghost books)."""
@@ -2728,6 +3091,7 @@ class HyperPolyFeed:
                     delta_ts = time.monotonic()
                     msg_ex_ts = _ws_exchange_ts_ms(m)
                     _delta_touched: Set[str] = set()  # L1 FIX
+                    _last_change: Dict[str, dict] = {}  # R28: last change per asset in this frame
                     for c in m.get('price_changes', m.get('changes', [])):
                         c_tid = c.get('asset_id', tid)
                         if c_tid not in self._books or c_tid not in self._snapshot_received:
@@ -2756,9 +3120,41 @@ class HyperPolyFeed:
                             self._snapshot_received.discard(c_tid)
                             bk.exchange_ts_ms = None
                             _delta_touched.discard(c_tid)
+                            _last_change.pop(c_tid, None)
                             self.log.debug('crossed book %s after delta â€” awaiting snapshot', c_tid[:10])
                         else:
                             _delta_touched.add(c_tid)
+                            _last_change[c_tid] = c
+                    # R28: compare AFTER the whole frame is applied - one frame can
+                    # carry several changes for the same asset. A single
+                    # disagreement is not proof (measured: the venue field is
+                    # inconsistent on ~41% of frames), so repair on repeated
+                    # strikes and only stop trading on impossible depth.
+                    for c_tid, c_last in _last_change.items():
+                        d_bk = self._books.get(c_tid)
+                        if d_bk is None:
+                            continue
+                        if self._phantom_depth(d_bk, c_last):
+                            self._snapshot_received.discard(c_tid)
+                            _delta_touched.discard(c_tid)
+                            self._phantom_events += 1
+                            self._drift_strikes.pop(c_tid, None)
+                            self.request_resync(c_tid)
+                            if self._phantom_events <= 5 or self._phantom_events % 25 == 0:
+                                self.log.warning('L2 PHANTOM %s: local top %s/%s crosses venue %s/%s - book withdrawn until re-snapshot (event #%d)', c_tid[:10], d_bk.best_bid, d_bk.best_ask, c_last.get('best_bid'), c_last.get('best_ask'), self._phantom_events)
+                            continue
+                        if not self._delta_out_of_sync(d_bk, c_last):
+                            self._drift_strikes.pop(c_tid, None)
+                            continue
+                        strikes = self._drift_strikes.get(c_tid, 0) + 1
+                        self._drift_strikes[c_tid] = strikes
+                        if strikes < _BOOK_DRIFT_STRIKES:
+                            continue
+                        self._drift_strikes.pop(c_tid, None)
+                        self._drift_events += 1
+                        self.request_resync(c_tid)
+                        if self._drift_events <= 3 or self._drift_events % 100 == 0:
+                            self.log.info('L2 DRIFT %s: local top %s/%s vs venue %s/%s for %d frames - queued a REST re-snapshot (event #%d)', c_tid[:10], d_bk.best_bid, d_bk.best_ask, c_last.get('best_bid'), c_last.get('best_ask'), strikes, self._drift_events)
                     # L1 FIX: fan callbacks out on delta-updated books (once per
                     # token per message) so Polymarket-side moves trigger eval in
                     # event-driven mode, not only 'book' snapshots / Binance ticks.
@@ -2793,6 +3189,9 @@ class HyperPolyFeed:
                     bids = _levels(m.get('bids', []))
                     asks = _levels(m.get('asks', []))
                     bk.replace_snapshot(bids, asks)
+                    # R27: every 'book' event carries the market's current tick
+                    # (verified on the live feed) - a free authoritative update.
+                    self._note_tick(tid, m.get('tick_size'))
                     # Snapshots always win (allow_regression): resync venue clock after reconnect.
                     bk.touch(time.monotonic(), _ws_exchange_ts_ms(m), allow_regression=True)
                     if bk.is_crossed:
@@ -3759,6 +4158,9 @@ class FiveMinStrategy:
         self._tp1_taken: Dict[Tuple[str, str], float] = {}
         self._entry_edges: Dict[Tuple[str, str], float] = {}
         self._shares_in_flight: Dict[Tuple[str, str], float] = {}
+        # R26: (market_id, token) whose whole remaining position is below the
+        # venue share minimum - unsellable on the CLOB, redeemed at resolution.
+        self._dust_positions: Set[Tuple[str, str]] = set()
         self._exit_fail_counts: Dict[Tuple[str, str], int] = {}
         self._pending_redemptions: Dict[Tuple[str, str], Tuple[float, float, float]] = {}
         self._redeem_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -4901,6 +5303,36 @@ class FiveMinStrategy:
         if shares * (bid_price or 0.01) < 0.5:
             _rollback_inflight()
             return
+        # R26: the CLOB refuses anything under the market's share minimum, so a
+        # dust clip is a guaranteed reject and a dust *residual* can never be
+        # closed. Clamp up to the floor, never leave an unsellable remainder,
+        # and park a whole position below the floor for redemption.
+        _floor = venue_min_shares(mkt)
+        _pos = mkt.pos_yes if token_id == mkt.yes_token else mkt.pos_no
+        _held = float(getattr(_pos, 'shares', 0.0) or 0.0)
+        _other_flight = max(0.0, self._shares_in_flight.get(flight_key, 0.0) - shares)
+        _avail = max(0.0, _held - _other_flight)
+        if _avail + 1e-09 < _floor:
+            if flight_key not in self._dust_positions:
+                self._dust_positions.add(flight_key)
+                self.log.warning('DUST %s %s: %.2f shares < venue floor %.0f - cannot be sold on the CLOB, holding to resolution for redemption', label, mkt.coin or mkt.market_id[:10], _avail, _floor)
+            _rollback_inflight()
+            return
+        _want = shares
+        if _want + 1e-09 < _floor:
+            _want = _floor
+        if _avail - _want < _floor - 1e-09:
+            _want = _avail
+        _want = min(_want, _avail)
+        _want = math.floor(_want * 100.0) / 100.0
+        if _want + 1e-09 < _floor:
+            _rollback_inflight()
+            return
+        if abs(_want - shares) > 1e-09:
+            self.log.info('EXIT_SIZE %s %s: %.2f -> %.2f shares (venue floor %.0f, held %.2f, no dust residual)', label, mkt.coin or mkt.market_id[:10], shares, _want, _floor, _avail)
+            self._shares_in_flight[flight_key] = _other_flight + _want
+            shares = _want
+        self._dust_positions.discard(flight_key)
         tick = mkt.get_tick(token_id)
         dec, mt = mkt.tick_math(token_id)
         book = mkt.book_yes if token_id == mkt.yes_token else mkt.book_no
@@ -6241,11 +6673,11 @@ class LatencyArb:
         if self.cfg.adverse_select_gate:
             adv = self.om.adverse_ewma('latarb')
             if adv is not None and adv > self.cfg.max_adverse_bps:
-                self.log.info('SKIP LATARB %s: adverse EWMA %+.1fbps > cap %.1f â€” throttling FAK', coin, adv, self.cfg.max_adverse_bps)
-                return self._skip_latarb('adverse_ewma')
+                # R23: one throttled line per 30s instead of ~16k identical INFO
+                # lines (78% of the operator's 2.4MB session log).
+                return self._skip_latarb('adverse_ewma', '%s adverse EWMA %+.1fbps > cap %.1f - throttling FAK', coin, adv, self.cfg.max_adverse_bps)
             if adverse_gate(adv, book.mid, edge):
-                self.log.info('SKIP LATARB %s: adverse EWMA eats edge %.3f', coin, edge)
-                return self._skip_latarb('adverse_gate')
+                return self._skip_latarb('adverse_gate', '%s adverse EWMA eats edge %.3f', coin, edge)
         tick = mkt.get_tick(token)
         dec, mt = mkt.tick_math(token)
         book = mkt.book_yes if up else mkt.book_no
@@ -6663,6 +7095,15 @@ class RedemptionEngine:
         self.on_fatal: Optional[Callable[[str], None]] = None
         self._queue: 'asyncio.Queue[dict]' = asyncio.Queue()
         self._ready = False
+        # R30: Polygon RPC work gets its own thread so a stalled endpoint can
+        # never occupy the default executor shared with CLOB REST/SDK calls.
+        self._rpc_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='redeem-rpc')
+
+    def close(self) -> None:
+        try:
+            self._rpc_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
     def _notify_state(self) -> None:
         if self.on_state_change is not None:
@@ -6772,12 +7213,15 @@ class RedemptionEngine:
             self.log.info('Redeem engine disabled (REDEEM_ENABLED=false) â€” winning legs settle as soft estimates only')
             return
         loop = asyncio.get_running_loop()
+        # R30: Polygon RPC stalls must never occupy the default executor, which
+        # also serves CLOB balance / get_order / drift-reconcile calls.
+        pool = self._rpc_pool
         while True:
             item = await self._queue.get()
             key = (item['condition_id'], 'neg' if item.get('neg_risk') else 'ctf')
             delay = 0.0
             try:
-                updates = await loop.run_in_executor(None, self._advance_redeem, dict(item))
+                updates = await loop.run_in_executor(pool, self._advance_redeem, dict(item))
                 next_delay = float(updates.pop('_next_delay', 0.0) or 0.0)
                 for k, v in updates.items():
                     if v is None:
@@ -6997,12 +7441,26 @@ class RedemptionEngine:
         return changed
 
     def _gas_kwargs(self) -> dict:
+        # R19 FIX (live blocker, 2026-07-27 log): Polygon bor enforces a MINIMUM
+        # priority fee (25 gwei on mainnet). The old ceiling of 2 gwei meant every
+        # redemption was rejected by the node with
+        #   -32000 'transaction gas price below minimum: gas tip cap 2000000000,
+        #           minimum needed 25000000000'
+        # 144 retries, zero redemptions, so settled winners never turned back into
+        # USDC. Floor the tip at REDEEM_MIN_PRIORITY_GWEI (default 30) and make sure
+        # maxFeePerGas can actually carry it.
         base = int(self._w3.eth.gas_price)
         cap = int(float(self.cfg.redeem_max_gas_gwei) * 1_000_000_000.0)
         if cap > 0 and base > cap:
             raise RuntimeError(f'current gas price {base / 1e9:.3f} gwei exceeds redemption cap {cap / 1e9:.3f} gwei')
-        max_fee = min(base * 2, cap) if cap > 0 else base * 2
-        priority = min(2_000_000_000, max(0, max_fee - base))
+        priority = int(float(self.cfg.redeem_min_priority_gwei) * 1_000_000_000.0)
+        max_fee = base * 2 + priority
+        if cap > 0 and max_fee > cap:
+            max_fee = cap
+        if priority > max_fee:
+            priority = max_fee
+        if priority < int(float(self.cfg.redeem_min_priority_gwei) * 1_000_000_000.0):
+            raise RuntimeError(f'redemption cap {cap / 1e9:.1f} gwei cannot carry the required {self.cfg.redeem_min_priority_gwei:.1f} gwei priority fee (base {base / 1e9:.1f} gwei) - raise REDEEM_MAX_GAS_GWEI')
         return {'maxFeePerGas': int(max_fee), 'maxPriorityFeePerGas': int(priority)}
 
     def _signed_payload(self, tx: dict) -> dict:
@@ -7254,6 +7712,10 @@ class Bot:
             if self.session and (not self.session.closed):
                 await self.session.close()
             self.client.close()
+            try:
+                self.redeemer.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _remember_bounded(value: str, order: Deque[str], values: Set[str]) -> None:
@@ -7664,6 +8126,7 @@ class Bot:
         self.tracker = PriceTracker(self.chainlink, self.cfg.prob_shrink, min_order_size_usdc=self.cfg.min_order_size, momentum_weight=self.cfg.momentum_weight)
         self._load_calibration_shrink()
         self.polyfeed.on_update(self._on_book)
+        self.polyfeed.set_tick_sink(self._on_tick_change)
         self.binance.on_update(self._on_price)
         self.chainlink.on_update(self._on_oracle_price)
         self.fivemin = FiveMinStrategy(self.cfg, self.om, self.risk, self.tracker, self.metrics)
@@ -7864,7 +8327,7 @@ class Bot:
         mode = 'DRY RUN' if self.cfg.dry_run else 'LIVE'
         arch = 'EVENT-DRIVEN' if self.cfg.event_driven else 'TIMER'
         self.log.info('Started [%s] [%s]  sig=%d  bal=$%.2f  mkts=%d  shards=%d  json=%s', mode, arch, self.cfg.signature_type, balance, len(self.markets), self.cfg.ws_shard_count, 'orjson' if _FAST_JSON else 'stdlib')
-        self.tasks = [asyncio.create_task(self.polyfeed.run(), name='polyfeed'), asyncio.create_task(self.binance.run(), name='binance'), asyncio.create_task(self.chainlink.run(), name='chainlink'), asyncio.create_task(self._reconcile_loop(), name='reconcile'), asyncio.create_task(self._health_loop(), name='health'), asyncio.create_task(self._status_loop(), name='status'), asyncio.create_task(self._fivemin_refresh(), name='discovery'), asyncio.create_task(self.redeemer.run(), name='redeem'), asyncio.create_task(self._shutdown_wait(), name='shutdown')]
+        self.tasks = [asyncio.create_task(self.polyfeed.run(), name='polyfeed'), asyncio.create_task(self.binance.run(), name='binance'), asyncio.create_task(self.chainlink.run(), name='chainlink'), asyncio.create_task(self._reconcile_loop(), name='reconcile'), asyncio.create_task(self._health_loop(), name='health'), asyncio.create_task(self._status_loop(), name='status'), asyncio.create_task(self._fivemin_refresh(), name='discovery'), asyncio.create_task(self._book_resync_loop(), name='book_resync'), asyncio.create_task(self.redeemer.run(), name='redeem'), asyncio.create_task(self._shutdown_wait(), name='shutdown')]
         if self._redeem_reconcile_deferred:
             self.tasks.append(asyncio.create_task(self._redeem_reconcile_retry_loop(), name='redeem_reconcile_retry'))
         if not self.cfg.dry_run:
@@ -7875,6 +8338,106 @@ class Bot:
             await asyncio.gather(*self.tasks)
         except asyncio.CancelledError:
             pass
+
+    def _on_tick_change(self, token_id: str, tick: float) -> None:
+        """R27: a WS 'book' snapshot reported a tick - resync both caches.
+
+        Polymarket re-ticks a market as its price approaches an extreme, and the
+        SDK memoises the old value forever, so this has to invalidate the SDK
+        cache as well as ours.
+        """
+        try:
+            self.client._persist_tick(token_id, float(tick))
+        except Exception as e:
+            self.log.debug('tick change %s ignored: %s', token_id[:10], e)
+
+    async def _resync_book(self, tid: str) -> bool:
+        """R28: pull a full REST snapshot for one token and reset the local book.
+
+        Also refreshes the venue's tick and share minimum, which GET /book
+        returns alongside the depth.
+        """
+        if self.session is None:
+            return False
+        try:
+            async with self.session.get(f'{self.cfg.clob_url}/book', params={'token_id': tid}, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if not r.ok:
+                    return False
+                d = await r.json(content_type=None)
+        except Exception as e:
+            self.log.debug('book resync %s failed: %s', tid[:12], e)
+            return False
+        bk = self.polyfeed.book(tid)
+        if not bk or not isinstance(d, dict):
+            return False
+        def _levels(rows):
+            out = []
+            for x in rows or []:
+                try:
+                    p, sz = (float(x['price']), float(x['size']))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(p) and math.isfinite(sz) and p > 0 and sz > 0:
+                    out.append((p, sz))
+            return out
+        bk.replace_snapshot(_levels(d.get('bids')), _levels(d.get('asks')))
+        bk.touch(time.monotonic(), allow_regression=True)
+        if bk.is_crossed:
+            self.polyfeed._snapshot_received.discard(tid)
+            bk.exchange_ts_ms = None
+            return False
+        self.polyfeed._snapshot_received.add(tid)
+        m = self.t2m.get(tid)
+        if m is not None:
+            if tid == m.yes_token:
+                m.book_yes = bk
+            else:
+                m.book_no = bk
+            try:
+                mos = float(d.get('min_order_size') or 0.0)
+                if mos > 0 and (m.min_order_size is None or mos > float(m.min_order_size)):
+                    m.min_order_size = mos
+            except (TypeError, ValueError):
+                pass
+            try:
+                ts = float(d.get('tick_size') or 0.0)
+                if 0.0 < ts < 1.0:
+                    self.client._persist_tick(tid, ts)
+            except (TypeError, ValueError):
+                pass
+        return True
+
+    async def _book_resync_loop(self) -> None:
+        """R28: repair drifted books immediately, and re-snapshot on a cadence.
+
+        Delta streams lose messages; without this a local book can diverge from
+        the venue until the next reconnect and the bot trades phantom depth.
+        """
+        await asyncio.sleep(20)
+        last_full = time.monotonic()
+        sem = asyncio.Semaphore(6)
+        async def _one(tid: str) -> bool:
+            async with sem:
+                return await self._resync_book(tid)
+        while self.running:
+            try:
+                await asyncio.sleep(2.0)
+                drifted = self.polyfeed.take_resync_requests()
+                if drifted:
+                    ok = await asyncio.gather(*[_one(t) for t in drifted], return_exceptions=True)
+                    self.log.info('BOOK RESYNC (drift): %d/%d tokens restored', sum(1 for r in ok if r is True), len(drifted))
+                period = float(self.cfg.book_resync_s or 0.0)
+                if period > 0 and time.monotonic() - last_full >= period:
+                    last_full = time.monotonic()
+                    toks = [t for t, m in list(self.t2m.items()) if not getattr(m, '_recovery_placeholder', False)]
+                    if toks:
+                        res = await asyncio.gather(*[_one(t) for t in toks], return_exceptions=True)
+                        self.log.debug('BOOK RESYNC (periodic): %d/%d tokens', sum(1 for r in res if r is True), len(toks))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.log.warning('book resync loop error (non-fatal): %s', e)
+                await asyncio.sleep(5.0)
 
     async def _seed_books(self) -> None:
         self.log.info('Seeding order books and tick sizesâ€¦')
@@ -7902,6 +8465,12 @@ class Bot:
                             else:
                                 m.book_no = bk
                             # P1: market-specific ConditionalToken share minimum from book API
+                            try:
+                                _bts = float(d.get('tick_size') or 0.0)
+                                if 0.0 < _bts < 1.0:
+                                    m.set_tick(tid, _bts)
+                            except (TypeError, ValueError):
+                                pass
                             for _mk in ('min_order_size', 'minOrderSize', 'minimum_order_size'):
                                 if d.get(_mk) is None:
                                     continue
@@ -8278,7 +8847,7 @@ class Bot:
         self.log.info('_replay_rest_fill: applying %s %s @ %.4f (%.4f shares) id=%s (mkt=%s)', side_raw, asset_id[:12], price, size, trade_id[:16], mkt.market_id[:8])
         return await self._on_fill(mkt, asset_id, side_raw, size, price, trade_id=trade_id, order_ids=order_ids, aggregate_ioc=bool(trade.get('_ioc_aggregate')))
 
-    async def _check_position_drift(self) -> int:
+    async def _check_position_drift(self, _reconciled: bool=False) -> int:
         # R8: mark coverage unknown until this run actually completes.
         self._last_drift_nan = -1
         self._last_drift_legs = 0
@@ -8379,6 +8948,23 @@ class Bot:
         self._last_drift_nan = int(nan_count)
         self._last_drift_legs = len(results)
         if drift_count:
+            # R24 FIX (2026-07-27 log): every drift the operator hit was UNDER -
+            # the venue had matched a FAK the local book had not booked yet - and
+            # the halt killed the process 8 times in 90 minutes, abandoning the
+            # position each time. A fill the REST trade feed can still explain is
+            # a bookkeeping lag, not a data-integrity fault: reconcile once, then
+            # re-check. A drift that survives that still halts, as before.
+            if not _reconciled and self.om is not None:
+                self.log.warning('drift on %d market(s) - forcing a REST fill reconciliation before halting', drift_count)
+                try:
+                    await self.om.reconcile_fills(wait_if_busy=True)
+                except Exception as e:
+                    self.log.error('pre-halt reconciliation failed: %s', e)
+                else:
+                    recheck = await self._check_position_drift(_reconciled=True)
+                    if recheck == 0:
+                        self.log.warning('drift cleared by reconciliation (%d leg(s) were unbooked fills) - continuing', drift_count)
+                    return recheck
             self.risk._halt(f'position drift on {drift_count} market(s); first: {first_msg}', halt_type='drift')
         return drift_count
 
